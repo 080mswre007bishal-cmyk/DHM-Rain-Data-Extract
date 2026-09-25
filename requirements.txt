@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+playwright
+openpyxl
+google-api-python-client
+google-auth

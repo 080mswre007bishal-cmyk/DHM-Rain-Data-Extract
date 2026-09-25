@@ -1,0 +1,47 @@
+name: Debug Rainfall Extraction
+
+# Run this manually from the Actions tab BEFORE trusting the twice-daily
+# job: Actions -> "Debug Rainfall Extraction" -> "Run workflow". It tests
+# a few stations and saves a screenshot + the page text from right after
+# clicking VIEW for each one, as a downloadable zip attached to the run
+# (look for "Artifacts" at the bottom of the run's summary page).
+#
+# Open each screenshot next to its matching .txt file and check: is the
+# number main.py picked out actually the 24h rainfall figure shown on
+# the page? If not, edit extract_daily_rainfall() in main.py (you can
+# edit it right here on GitHub -- open main.py, click the pencil icon)
+# using that .txt file as your reference for what really appears.
+on:
+  workflow_dispatch:
+    inputs:
+      station_count:
+        description: "How many stations to test"
+        default: "3"
+        required: true
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run debug scrape (no Drive upload happens in debug mode)
+        env:
+          DEBUG_STATIONS: ${{ github.event.inputs.station_count }}
+        run: python main.py
+
+      - name: Upload debug screenshots + text
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: output/debug/
+          retention-days: 7

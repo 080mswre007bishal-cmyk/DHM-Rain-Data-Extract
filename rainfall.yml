@@ -1,0 +1,40 @@
+name: DHM Rainfall Scrape
+
+on:
+  schedule:
+    # Times are UTC. Nepal is UTC+5:45.
+    # 03:15 UTC = 09:00 NPT, 15:15 UTC = 21:00 NPT.
+    # Adjust to whenever DHM's daily reading is actually published if needed.
+    - cron: "15 3,15 * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: python main.py
+
+      # Optional: also keep a copy of the day's output as a workflow
+      # artifact, in case you want a backup independent of Drive.
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rainfall-output-${{ github.run_id }}
+          path: output/
+          retention-days: 7

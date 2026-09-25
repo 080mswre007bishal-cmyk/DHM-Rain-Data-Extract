@@ -1,0 +1,33 @@
+name: Discover Stations (run once)
+
+# Run this manually, ONCE, from the Actions tab: Actions -> "Discover
+# Stations (run once)" -> "Run workflow". It sweeps DHM's plain HTML
+# pages, builds stations.json, and commits it straight back into your
+# repo -- nothing to download or upload by hand. Takes ~10-15 minutes.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed so the workflow can commit stations.json back
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run discovery sweep
+        run: python discover_stations.py
+
+      - name: Commit stations.json to the repo
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Add/update stations.json from discovery sweep"
+          file_pattern: stations.json
