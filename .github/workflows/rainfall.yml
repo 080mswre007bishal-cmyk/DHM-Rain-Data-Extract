@@ -3,9 +3,13 @@ name: DHM Rainfall Scrape
 on:
   schedule:
     # Times are UTC. Nepal is UTC+5:45.
-    # 03:15 UTC = 09:00 NPT, 15:15 UTC = 21:00 NPT.
-    # Adjust to whenever DHM's daily reading is actually published if needed.
-    - cron: "15 3,15 * * *"
+    # 04:15 UTC = 10:00 AM NPT
+    # 15:45 UTC = 09:30 PM NPT
+    # 18:15 UTC = 12:00 AM midnight NPT (next day)
+    - cron: "15 4 * * *"
+    - cron: "45 15 * * *"
+    - cron: "15 18 * * *"
+
   workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
 
 jobs:
@@ -29,8 +33,6 @@ jobs:
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: python main.py
 
-      # Optional: also keep a copy of the day's output as a workflow
-      # artifact, in case you want a backup independent of Drive.
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4
