@@ -1,3 +1,4 @@
+
 """
 main.py
 -------
@@ -11,23 +12,10 @@ For every station in stations.json:
      station, so it becomes a running history over time).
   5. Upload/update that file in a Google Drive folder.
 
-IMPORTANT — please read before relying on this in production:
-I built this against the *static* HTML of the DHM pages (confirmed by
-fetching them), but I could not load the live JavaScript app myself to
-watch exactly what the page looks like right after you click VIEW —
-my environment can't reach dhm.gov.np, and the underlying data call
-isn't visible to a text-based fetch. So step 3 (extract_daily_rainfall)
-uses a generic, resilient approach: it snapshots the page text before
-and after clicking VIEW and pulls the new number(s) out of the diff,
-rather than depending on one exact CSS selector that might be wrong.
-
-Run with DEBUG_STATIONS=3 first (see bottom of file) to check a few
-stations, look at the saved screenshots/text in output/debug/, and
-confirm the number it picked is actually the 24h rainfall figure. If
-it's picking the wrong number (e.g. a date or station index), adjust
-`extract_daily_rainfall()` — that's the one function you may need to
-tune, everything else (Excel writing, Drive upload, scheduling) is
-independent of that and doesn't need touching.
+IMPORTANT:
+Run with DEBUG_STATIONS=3 first. Check the screenshots and text files
+in output/debug/ to confirm that the extracted number is actually the
+24-hour rainfall figure displayed on the DHM page.
 
 Usage:
     pip install playwright openpyxl google-api-python-client google-auth
@@ -44,12 +32,14 @@ import time
 from openpyxl import Workbook, load_workbook
 from playwright.sync_api import sync_playwright
 
+
 STATIONS_FILE = "stations.json"
 OUTPUT_DIR = "output"
 DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
 STATION_URL = "https://dhm.gov.np/hydrology/rainfallSingle/{}"
 
-# Set via env var for a quick local test, e.g. DEBUG_STATIONS=3 python main.py
+# Set via environment variable for a quick test:
+# DEBUG_STATIONS=3 python main.py
 DEBUG_STATIONS = int(os.environ.get("DEBUG_STATIONS", "0"))
 
 
@@ -64,49 +54,96 @@ def extract_daily_rainfall(page, debug_tag=None):
     Best-effort extraction of the 24h accumulated rainfall value.
     Returns a float (mm) or None if nothing usable was found.
     """
+
+    # Capture page text before selecting Daily and clicking VIEW.
     before = page.inner_text("body")
 
-    # Select "Daily" period — try a few likely ways the site exposes this,
-    # since the exact element (radio/tab/button) wasn't confirmed live.
-    for selector in ["text=Daily", "label:has-text('Daily')", "[value='daily']"]:
+    # Select the Daily period.
+    # Try a few likely ways the site exposes this element.
+    for selector in [
+        "text=Daily",
+        "label:has-text('Daily')",
+        "[value='daily']",
+    ]:
         try:
             page.click(selector, timeout=2000)
             break
         except Exception:
             continue
 
-    # Click VIEW
-    for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
+    # Click VIEW.
+    for selector in [
+        "text=VIEW",
+        "button:has-text('VIEW')",
+        "input[value='VIEW']",
+    ]:
         try:
             page.click(selector, timeout=3000)
             break
         except Exception:
             continue
 
-    # Give the AJAX call time to complete
+    # Give the AJAX request time to complete.
     try:
         page.wait_for_load_state("networkidle", timeout=8000)
     except Exception:
         page.wait_for_timeout(3000)
 
+    # Capture page text after clicking VIEW.
     after = page.inner_text("body")
 
+    # Save screenshot and page text in debug mode.
     if debug_tag:
         os.makedirs(DEBUG_DIR, exist_ok=True)
-        page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}.png"))
-        with open(os.path.join(DEBUG_DIR, f"{debug_tag}.txt"), "w", encoding="utf-8") as f:
-            f.write("=== BEFORE ===\n" + before + "\n\n=== AFTER ===\n" + after)
 
-    before_lines = set(l.strip() for l in before.split("\n") if l.strip())
-    after_lines = [l.strip() for l in after.split("\n") if l.strip()]
-    new_lines = [l for l in after_lines if l not in before_lines]
+        screenshot_path = os.path.join(
+            DEBUG_DIR, f"{debug_tag}.png"
+        )
 
-    # Look for a plausible rainfall number (decimal, 0-999 mm range) in
-    # the newly-appeared text.
+        text_path = os.path.join(
+            DEBUG_DIR, f"{debug_tag}.txt"
+        )
+
+        page.screenshot(path=screenshot_path)
+
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(
+                "=== BEFORE ===\n"
+                + before
+                + "\n\n=== AFTER ===\n"
+                + after
+            )
+
+    # Identify lines that appeared after clicking VIEW.
+    before_lines = set(
+        line.strip()
+        for line in before.split("\n")
+        if line.strip()
+    )
+
+    after_lines = [
+        line.strip()
+        for line in after.split("\n")
+        if line.strip()
+    ]
+
+    new_lines = [
+        line
+        for line in after_lines
+        if line not in before_lines
+    ]
+
+    # Find plausible rainfall numbers in the newly appeared text.
+    # NOTE: This is a best-effort method and must be verified
+    # against the screenshots and saved page text.
     candidates = []
+
     for line in new_lines:
-        for match in re.findall(r"\d+\.\d+|\d+", line):
+        matches = re.findall(r"\d+\.\d+|\d+", line)
+
+        for match in matches:
             val = float(match)
+
             if 0 <= val < 1000:
                 candidates.append(val)
 
@@ -114,52 +151,88 @@ def extract_daily_rainfall(page, debug_tag=None):
 
 
 def write_station_excel(path, timestamp, date_str, value):
+    """Append a rainfall record to the station's Excel file."""
+
     if os.path.exists(path):
         wb = load_workbook(path)
         ws = wb.active
     else:
         wb = Workbook()
         ws = wb.active
-        ws.append(["Timestamp (UTC)", "Date", "24h Rainfall (mm)"])
+        ws.append([
+            "Timestamp (UTC)",
+            "Date",
+            "24h Rainfall (mm)",
+        ])
 
     ws.append([timestamp, date_str, value])
     wb.save(path)
 
 
 def get_drive_service():
-    """Build a Google Drive API client from a service account.
-    Expects GOOGLE_SERVICE_ACCOUNT_JSON env var to contain the *contents*
-    of the service account JSON key (not a file path) — this is how the
-    GitHub Actions workflow supplies it from a secret.
     """
+    Build a Google Drive API client from a service account.
+
+    Expects GOOGLE_SERVICE_ACCOUNT_JSON to contain the contents
+    of the service account JSON key.
+    """
+
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
 
     creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     creds_dict = json.loads(creds_json)
+
     creds = service_account.Credentials.from_service_account_info(
-        creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
+
     return build("drive", "v3", credentials=creds)
 
 
 def upload_to_drive(service, folder_id, filepath, filename):
+    """Upload a new file or update an existing file in Google Drive."""
+
     from googleapiclient.http import MediaFileUpload
 
-    query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
-    results = service.files().list(q=query, fields="files(id)").execute()
+    query = (
+        f"name='{filename}' and "
+        f"'{folder_id}' in parents and trashed=false"
+    )
+
+    results = (
+        service.files()
+        .list(q=query, fields="files(id)")
+        .execute()
+    )
+
     files = results.get("files", [])
 
     media = MediaFileUpload(
         filepath,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
     )
 
     if files:
-        service.files().update(fileId=files[0]["id"], media_body=media).execute()
+        service.files().update(
+            fileId=files[0]["id"],
+            media_body=media,
+        ).execute()
     else:
-        metadata = {"name": filename, "parents": [folder_id]}
-        service.files().create(body=metadata, media_body=media, fields="id").execute()
+        metadata = {
+            "name": filename,
+            "parents": [folder_id],
+        }
+
+        service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id",
+        ).execute()
 
 
 def main():
@@ -168,53 +241,116 @@ def main():
     with open(STATIONS_FILE, encoding="utf-8") as f:
         stations = json.load(f)
 
+    # In debug mode, process only the requested number of stations.
     if DEBUG_STATIONS:
         stations = stations[:DEBUG_STATIONS]
-        print(f"DEBUG MODE: running only {len(stations)} station(s)")
 
+        # Clear old debug files so the artifact contains only
+        # results from the current run.
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+
+        for filename in os.listdir(DEBUG_DIR):
+            filepath = os.path.join(DEBUG_DIR, filename)
+
+            if os.path.isfile(filepath):
+                os.remove(filepath)
+
+        print(
+            f"DEBUG MODE: running only "
+            f"{len(stations)} station(s)"
+        )
+
+    # Google Drive is disabled in debug mode.
     drive_service = None
     folder_id = os.environ.get("DRIVE_FOLDER_ID")
-    if not DEBUG_STATIONS and "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ and folder_id:
+
+    if (
+        not DEBUG_STATIONS
+        and "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ
+        and folder_id
+    ):
         drive_service = get_drive_service()
 
     now = datetime.datetime.utcnow()
+
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     date_str = now.strftime("%Y-%m-%d")
 
     with sync_playwright() as p:
-        # Always headless: this runs on GitHub's servers, which have no
-        # display. Debug mode still works — it saves a screenshot and the
-        # before/after page text to output/debug/ so you can inspect the
-        # result afterward instead of watching a live browser window.
+
+        # GitHub Actions runs without a display, so use headless mode.
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         for station in stations:
             url_id = station["url_id"]
             name = station["name"]
+
             print(f"-> {name} (url_id={url_id})")
 
             try:
-                page.goto(STATION_URL.format(url_id), timeout=20000)
-                debug_tag = f"{url_id}_{re.sub(r'[^\w-]+', '_', name)}" if DEBUG_STATIONS else None
-                value = extract_daily_rainfall(page, debug_tag=debug_tag)
+                page.goto(
+                    STATION_URL.format(url_id),
+                    timeout=20000,
+                )
+
+                # FIX: Build the cleaned station name separately.
+                # This avoids backslashes inside an f-string
+                # expression, which cause a SyntaxError in Python 3.11.
+                clean_name = re.sub(
+                    r"[^\w-]+",
+                    "_",
+                    name,
+                )
+
+                debug_tag = (
+                    f"{url_id}_{clean_name}"
+                    if DEBUG_STATIONS
+                    else None
+                )
+
+                value = extract_daily_rainfall(
+                    page,
+                    debug_tag=debug_tag,
+                )
+
             except Exception as e:
                 print(f"   failed: {e}")
                 value = None
 
             print(f"   24h rainfall: {value}")
 
-            filename = safe_filename(name, station.get("station_index"), url_id)
-            filepath = os.path.join(OUTPUT_DIR, filename)
-            write_station_excel(filepath, timestamp, date_str, value)
+            filename = safe_filename(
+                name,
+                station.get("station_index"),
+                url_id,
+            )
 
+            filepath = os.path.join(
+                OUTPUT_DIR,
+                filename,
+            )
+
+            write_station_excel(
+                filepath,
+                timestamp,
+                date_str,
+                value,
+            )
+
+            # Upload only during normal production runs.
             if drive_service:
                 try:
-                    upload_to_drive(drive_service, folder_id, filepath, filename)
+                    upload_to_drive(
+                        drive_service,
+                        folder_id,
+                        filepath,
+                        filename,
+                    )
                 except Exception as e:
                     print(f"   drive upload failed: {e}")
 
-            time.sleep(0.5)  # be polite to the server
+            time.sleep(0.5)  # Be polite to the server.
 
         browser.close()
 
