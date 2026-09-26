@@ -1,3 +1,50 @@
+"""
+main.py
+-------
+For every station in stations.json:
+  1. Open its DHM page in a headless browser.
+  2. Select the "Daily" period and click VIEW. On the pages I could
+     confirm (dhm.gov.np/hydrology/rainfallSingle/<id>), this reveals
+     an "Accumulated Rainfall" table -- the same widget you found on
+     the rainfall-watch-map page. This is loaded by JavaScript, so a
+     real browser is used instead of a plain HTTP request.
+  3. Read every (date, value) pair that appears -- normally the last
+     8 days.
+  4. For each station's output/<station>.xlsx, skip any date already
+     recorded and append only the new ones. Running this twice, or
+     missing a scheduled run, does not create duplicates and
+     self-heals small gaps because each run re-reads the last 8 days.
+  5. If any new rows were added, upload/update that file in a Google
+     Drive folder.
+
+IMPORTANT -- please read before relying on this in production:
+I confirmed the STATIC HTML of the DHM station pages by fetching them
+directly (the "Period: Point / Hourly / Daily / Point for 7 days" and
+"VIEW" / "Accumulated Rainfall" labels are really there). What I could
+NOT confirm is exactly how the 8-day table is laid out in the page
+text right after you click VIEW -- my environment can't reach
+dhm.gov.np or run a real browser against it, so I never got to see
+that table's actual text. extract_rainfall_history() below is a
+best-effort, generic parser: it snapshots the page text before/after
+clicking, looks for date-shaped tokens in the new text, and pairs each
+one with the nearest plausible number (0-999). It is very likely to
+need a tweak.
+
+Run with DEBUG_STATIONS=3 first (see bottom of file). It saves a
+screenshot AND the full before/after page text to output/debug/ for
+each station -- open the .txt file, find the real table text, and
+check whether the (date, value) pairs printed in the log actually
+match. If not, adjust extract_rainfall_history() below using that
+saved text as your reference. That's the one function you should
+expect to tune; the Excel/dedup/Drive-upload logic under it doesn't
+depend on getting the parsing exactly right on the first try.
+
+Usage:
+    pip install playwright openpyxl google-api-python-client google-auth
+    playwright install chromium
+    python main.py
+"""
+
 import datetime
 import json
 import os
@@ -7,1046 +54,260 @@ import time
 from openpyxl import Workbook, load_workbook
 from playwright.sync_api import sync_playwright
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
 STATIONS_FILE = "stations.json"
-
 OUTPUT_DIR = "output"
 DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
-
 STATION_URL = "https://dhm.gov.np/hydrology/rainfallSingle/{}"
 
-# Set DEBUG_STATIONS to a number such as 3 to test only the
-# first 3 stations.
-#
-# If DEBUG_STATIONS is not set, all stations will be processed.
-DEBUG_STATIONS = int(
-    os.environ.get("DEBUG_STATIONS", "0")
-)
+# Set via env var for a quick test, e.g. DEBUG_STATIONS=3 python main.py
+DEBUG_STATIONS = int(os.environ.get("DEBUG_STATIONS", "0"))
+
+# How many days back the DHM "Daily" + VIEW table is expected to show.
+# You said 8 -- adjust here if the debug output shows a different count.
+HISTORY_DAYS = 8
+
+# Date formats DHM might use in the table (tried in this order). The
+# site's own header shows dates like "10 Jun, 2026", so that's first.
+DATE_PATTERNS = [
+    r"\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}",   # 10 Jun, 2026 / 10 June 2026
+    r"\d{4}-\d{2}-\d{2}",                    # 2026-06-10
+    r"\d{1,2}/\d{1,2}/\d{4}",                # 10/06/2026
+    r"\d{1,2}-\d{1,2}-\d{4}",                # 10-06-2026
+]
+DATE_FORMATS = [
+    "%d %b, %Y", "%d %B, %Y", "%d %b %Y", "%d %B %Y",
+    "%Y-%m-%d",
+    "%d/%m/%Y", "%m/%d/%Y",
+    "%d-%m-%Y",
+]
 
 
-# ============================================================
-# DIRECTORIES
-# ============================================================
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-if DEBUG_STATIONS:
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-
-
-# ============================================================
-# LOAD STATIONS
-# ============================================================
-
-with open(
-    STATIONS_FILE,
-    "r",
-    encoding="utf-8",
-) as f:
-
-    stations = json.load(f)
-
-
-# ============================================================
-# SAFE EXCEL FILENAME
-# ============================================================
-
-def safe_filename(
-    name,
-    station_index,
-    url_id,
-):
-
+def safe_filename(name, station_index, url_id):
     base = station_index or url_id
+    clean_name = re.sub(r"[^\w\-]+", "_", name).strip("_")
+    return f"{base}_{clean_name}.xlsx"
 
-    return f"{base}.xlsx"
 
-
-# ============================================================
-# EXTRACT DAILY RAINFALL
-# ============================================================
-
-def extract_daily_rainfall(
-    page,
-    debug_tag=None,
-):
-
-    # --------------------------------------------------------
-    # Select Daily
-    # --------------------------------------------------------
-
-    daily_selectors = [
-        "text=Daily",
-        "label:has-text('Daily')",
-        "[value='daily']",
-        "input[value='Daily']",
-        "input[value='daily']",
-    ]
-
-    daily_selected = False
-
-    for selector in daily_selectors:
-
+def parse_date_token(token):
+    token = token.strip()
+    for fmt in DATE_FORMATS:
         try:
+            return datetime.datetime.strptime(token, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
-            locator = page.locator(selector)
 
-            if locator.count() > 0:
+def find_date_and_rest(line):
+    """Find the first date-shaped token in `line`. Returns
+    (normalized_date_str, line_with_date_removed) or (None, None)."""
+    for pattern in DATE_PATTERNS:
+        m = re.search(pattern, line)
+        if m:
+            parsed = parse_date_token(m.group(0))
+            if parsed:
+                rest = line[:m.start()] + line[m.end():]
+                return parsed, rest
+    return None, None
 
-                locator.first.click(
-                    timeout=3000
-                )
 
-                daily_selected = True
+def extract_rainfall_history(page, debug_tag=None):
+    """
+    Best-effort extraction of the multi-day rainfall table that appears
+    after selecting "Daily" and clicking VIEW.
+    Returns a list of (date_str, value) tuples, date_str normalized to
+    YYYY-MM-DD, newest/oldest order as found on the page.
+    """
+    before = page.inner_text("body")
 
-                print(
-                    f"   Selected Daily using: {selector}"
-                )
-
-                break
-
+    for selector in ["text=Daily", "label:has-text('Daily')", "[value='daily']"]:
+        try:
+            page.click(selector, timeout=2000)
+            break
         except Exception:
             continue
 
-    if not daily_selected:
-
-        print(
-            "   WARNING: Could not explicitly select Daily."
-        )
-
-
-    # --------------------------------------------------------
-    # Click VIEW
-    # --------------------------------------------------------
-
-    view_selectors = [
-        "text=VIEW",
-        "button:has-text('VIEW')",
-        "input[value='VIEW']",
-        "input[value='View']",
-        "button:has-text('View')",
-    ]
-
-    view_clicked = False
-
-    for selector in view_selectors:
-
+    for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
         try:
-
-            locator = page.locator(selector)
-
-            if locator.count() > 0:
-
-                locator.first.click(
-                    timeout=5000
-                )
-
-                view_clicked = True
-
-                print(
-                    f"   Clicked VIEW using: {selector}"
-                )
-
-                break
-
+            page.click(selector, timeout=3000)
+            break
         except Exception:
             continue
-
-    if not view_clicked:
-
-        print(
-            "   ERROR: Could not find/click VIEW."
-        )
-
-        return None
-
-
-    # --------------------------------------------------------
-    # Wait for data
-    # --------------------------------------------------------
 
     try:
-
-        page.wait_for_load_state(
-            "networkidle",
-            timeout=8000,
-        )
-
+        page.wait_for_load_state("networkidle", timeout=8000)
     except Exception:
-        pass
+        page.wait_for_timeout(3000)
 
-    time.sleep(5)
-
-
-    # --------------------------------------------------------
-    # Get page text
-    # --------------------------------------------------------
-
-    body_text = page.locator(
-        "body"
-    ).inner_text()
-
-
-    # --------------------------------------------------------
-    # Save debug screenshot and text
-    # --------------------------------------------------------
+    after = page.inner_text("body")
 
     if debug_tag:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}.png"))
+        with open(os.path.join(DEBUG_DIR, f"{debug_tag}.txt"), "w", encoding="utf-8") as f:
+            f.write("=== BEFORE ===\n" + before + "\n\n=== AFTER ===\n" + after)
 
-        screenshot_path = os.path.join(
-            DEBUG_DIR,
-            f"{debug_tag}.png",
-        )
+    before_lines = set(l.strip() for l in before.split("\n") if l.strip())
+    after_lines = [l.strip() for l in after.split("\n") if l.strip()]
+    new_lines = [l for l in after_lines if l not in before_lines]
 
-        text_path = os.path.join(
-            DEBUG_DIR,
-            f"{debug_tag}.txt",
-        )
-
-        try:
-
-            page.screenshot(
-                path=screenshot_path,
-                full_page=True,
-            )
-
-        except Exception as e:
-
-            print(
-                f"   WARNING: Could not save screenshot: {e}"
-            )
-
-        try:
-
-            with open(
-                text_path,
-                "w",
-                encoding="utf-8",
-            ) as f:
-
-                f.write(body_text)
-
-        except Exception as e:
-
-            print(
-                f"   WARNING: Could not save debug text: {e}"
-            )
-
-
-    # --------------------------------------------------------
-    # Find Accumulated Rainfall section
-    # --------------------------------------------------------
-
-    lines = body_text.splitlines()
-
-    accumulated_index = None
-
-    for i, line in enumerate(lines):
-
-        if "Accumulated Rainfall" in line:
-
-            accumulated_index = i
-
-            break
-
-
-    if accumulated_index is None:
-
-        print(
-            "   ERROR: 'Accumulated Rainfall' section not found."
-        )
-
-        return None
-
-
-    print(
-        "   Found Accumulated Rainfall section."
-    )
-
-
-    # --------------------------------------------------------
-    # Extract rainfall values
-    # --------------------------------------------------------
-    #
-    # The DHM table contains rainfall observations over time.
-    #
-    # We extract decimal values from the accumulated rainfall
-    # line and use the maximum value as the 24-hour accumulated
-    # rainfall figure.
-    # --------------------------------------------------------
-
-    line = lines[accumulated_index]
-
-    matches = re.findall(
-        r"(?<![\d.])\d+\.\d{1,2}(?![\d.])",
-        line,
-    )
-
-
-    # Sometimes the values may appear in the lines immediately
-    # following the heading, so if the heading line itself does
-    # not contain numbers, inspect the next few lines.
-
-    if not matches:
-
-        nearby_lines = lines[
-            accumulated_index:
-            accumulated_index + 15
-        ]
-
-        nearby_text = " ".join(
-            nearby_lines
-        )
-
-        matches = re.findall(
-            r"(?<![\d.])\d+\.\d{1,2}(?![\d.])",
-            nearby_text,
-        )
-
-
-    rainfall_values = []
-
-    for value_text in matches:
-
-        try:
-
-            value = float(value_text)
-
-            if 0 <= value <= 1000:
-
-                rainfall_values.append(
-                    value
-                )
-
-        except ValueError:
-
+    entries = []
+    seen_dates = set()
+    for i, line in enumerate(new_lines):
+        date_str, rest = find_date_and_rest(line)
+        if not date_str or date_str in seen_dates:
             continue
 
+        # Look for the rainfall number on the same line (after removing
+        # the date itself) first, then the next couple of lines -- the
+        # exact layout (same row vs. next row) isn't confirmed, see the
+        # module docstring.
+        value = None
+        for text in [rest] + new_lines[i + 1:i + 3]:
+            for match in re.findall(r"\d+\.\d+|\d+", text):
+                val = float(match)
+                if 0 <= val < 1000:
+                    value = val
+                    break
+            if value is not None:
+                break
 
-    if not rainfall_values:
+        if value is not None:
+            entries.append((date_str, value))
+            seen_dates.add(date_str)
 
-        print(
-            "   ERROR: No valid rainfall values found."
-        )
-
-        return None
-
-
-    total = max(
-        rainfall_values
-    )
-
-
-    print(
-        f"   Rainfall values found: {rainfall_values}"
-    )
-
-    print(
-        f"   24h rainfall selected: {total:.2f} mm"
-    )
+    return entries[:HISTORY_DAYS]
 
 
-    return total
+def get_existing_dates(path):
+    if not os.path.exists(path):
+        return set()
+    wb = load_workbook(path)
+    ws = wb.active
+    dates = set()
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row and row[0]:
+            dates.add(str(row[0]))
+    return dates
 
 
-# ============================================================
-# WRITE / UPDATE EXCEL
-# ============================================================
-
-def write_station_excel(
-    path,
-    date_str,
-    value,
-):
-
-    # --------------------------------------------------------
-    # Open existing workbook or create new workbook
-    # --------------------------------------------------------
-
+def append_new_rows(path, new_entries, run_timestamp):
+    """new_entries: list of (date_str, value) tuples NOT already in the
+    file. Appends one row per entry and saves."""
     if os.path.exists(path):
-
         wb = load_workbook(path)
-
         ws = wb.active
-
     else:
-
         wb = Workbook()
-
         ws = wb.active
+        ws.append(["Date", "Rainfall (mm)", "First recorded (UTC)"])
 
-        ws.title = "Rainfall"
-
-        ws.append(
-            [
-                "Date",
-                "24h Rainfall (mm)",
-            ]
-        )
-
-
-    # --------------------------------------------------------
-    # Check whether today's date already exists
-    # --------------------------------------------------------
-
-    existing_row = None
-
-    for row in range(
-        2,
-        ws.max_row + 1,
-    ):
-
-        existing_date = ws.cell(
-            row=row,
-            column=1,
-        ).value
-
-        if existing_date is None:
-
-            continue
-
-        existing_date = str(
-            existing_date
-        ).strip()
-
-        if existing_date == date_str:
-
-            existing_row = row
-
-            break
-
-
-    # --------------------------------------------------------
-    # Update existing date
-    # --------------------------------------------------------
-
-    if existing_row is not None:
-
-        ws.cell(
-            row=existing_row,
-            column=2,
-            value=value,
-        )
-
-    # --------------------------------------------------------
-    # Otherwise append new date
-    # --------------------------------------------------------
-
-    else:
-
-        ws.append(
-            [
-                date_str,
-                value,
-            ]
-        )
-
-
-    # --------------------------------------------------------
-    # Number formatting
-    # --------------------------------------------------------
-
-    for row in range(
-        2,
-        ws.max_row + 1,
-    ):
-
-        ws.cell(
-            row=row,
-            column=2,
-        ).number_format = "0.00"
-
-
-    # --------------------------------------------------------
-    # Save workbook
-    # --------------------------------------------------------
+    for date_str, value in sorted(new_entries):
+        ws.append([date_str, value, run_timestamp])
 
     wb.save(path)
 
 
-# ============================================================
-# GOOGLE DRIVE CONNECTION
-# ============================================================
-
 def get_drive_service():
-
+    """Build a Google Drive API client from a service account.
+    Expects GOOGLE_SERVICE_ACCOUNT_JSON env var to contain the *contents*
+    of the service account JSON key (not a file path) -- this is how the
+    GitHub Actions workflow supplies it from a secret.
+    """
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
 
-
-    # --------------------------------------------------------
-    # Read service-account JSON from GitHub Secret
-    # --------------------------------------------------------
-
-    creds_json = os.environ[
-        "GOOGLE_SERVICE_ACCOUNT_JSON"
-    ]
-
-
-    # --------------------------------------------------------
-    # Convert JSON string into dictionary
-    # --------------------------------------------------------
-
-    creds_dict = json.loads(
-        creds_json
+    creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    creds_dict = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
     )
+    return build("drive", "v3", credentials=creds)
 
 
-    # --------------------------------------------------------
-    # Authenticate
-    # --------------------------------------------------------
-
-    creds = (
-        service_account
-        .Credentials
-        .from_service_account_info(
-            creds_dict,
-            scopes=[
-                "https://www.googleapis.com/auth/drive"
-            ],
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Build Google Drive API service
-    # --------------------------------------------------------
-
-    return build(
-        "drive",
-        "v3",
-        credentials=creds,
-    )
-
-
-# ============================================================
-# UPLOAD / UPDATE FILE IN GOOGLE DRIVE
-# ============================================================
-
-def upload_to_drive(
-    service,
-    folder_id,
-    filepath,
-    filename,
-):
-
+def upload_to_drive(service, folder_id, filepath, filename):
     from googleapiclient.http import MediaFileUpload
 
-
-    # --------------------------------------------------------
-    # Search for an existing file with the same filename
-    # inside the target folder.
-    # --------------------------------------------------------
-
-    query = (
-        f"name='{filename}' and "
-        f"'{folder_id}' in parents and "
-        f"trashed=false"
-    )
-
-
-    results = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id,name)",
-        )
-        .execute()
-    )
-
-
-    files = results.get(
-        "files",
-        []
-    )
-
-
-    # --------------------------------------------------------
-    # Prepare Excel file for upload
-    # --------------------------------------------------------
+    query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    files = results.get("files", [])
 
     media = MediaFileUpload(
         filepath,
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-
-    # --------------------------------------------------------
-    # UPDATE existing file
-    # --------------------------------------------------------
 
     if files:
-
-        file_id = files[0]["id"]
-
-        print(
-            f"   Updating Google Drive file: {filename}"
-        )
-
-
-        (
-            service.files()
-            .update(
-                fileId=file_id,
-                media_body=media,
-            )
-            .execute()
-        )
-
-
-        print(
-            f"   SUCCESS: {filename} updated in Google Drive."
-        )
-
-
-    # --------------------------------------------------------
-    # CREATE new file
-    # --------------------------------------------------------
-
+        service.files().update(fileId=files[0]["id"], media_body=media).execute()
     else:
+        metadata = {"name": filename, "parents": [folder_id]}
+        service.files().create(body=metadata, media_body=media, fields="id").execute()
 
-        print(
-            f"   Creating Google Drive file: {filename}"
-        )
-
-
-        metadata = {
-            "name": filename,
-            "parents": [folder_id],
-        }
-
-
-        (
-            service.files()
-            .create(
-                body=metadata,
-                media_body=media,
-                fields="id",
-            )
-            .execute()
-        )
-
-
-        print(
-            f"   SUCCESS: {filename} created in Google Drive."
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(
-        "=================================================="
-    )
-
-    print(
-        "DHM Rainfall Extraction"
-    )
-
-    print(
-        "=================================================="
-    )
-
-
-    # --------------------------------------------------------
-    # Determine number of stations
-    # --------------------------------------------------------
+    with open(STATIONS_FILE, encoding="utf-8") as f:
+        stations = json.load(f)
 
     if DEBUG_STATIONS:
-
-        stations_to_process = stations[
-            :DEBUG_STATIONS
-        ]
-
-        print(
-            f"DEBUG MODE: Processing first "
-            f"{DEBUG_STATIONS} stations."
-        )
-
-    else:
-
-        stations_to_process = stations
-
-        print(
-            f"PRODUCTION MODE: Processing all "
-            f"{len(stations_to_process)} stations."
-        )
-
-
-    # --------------------------------------------------------
-    # Nepal date/time
-    # --------------------------------------------------------
-
-    nepal_timezone = datetime.timezone(
-        datetime.timedelta(
-            hours=5,
-            minutes=45,
-        )
-    )
-
-
-    now = datetime.datetime.now(
-        nepal_timezone
-    )
-
-
-    date_str = now.strftime(
-        "%Y/%m/%d"
-    )
-
-
-    print(
-        f" Nepal date: {date_str}"
-    )
-
-
-    # --------------------------------------------------------
-    # Google Drive setup
-    # --------------------------------------------------------
+        stations = stations[:DEBUG_STATIONS]
+        print(f"DEBUG MODE: running only {len(stations)} station(s)")
 
     drive_service = None
+    folder_id = os.environ.get("DRIVE_FOLDER_ID")
+    if not DEBUG_STATIONS and "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ and folder_id:
+        drive_service = get_drive_service()
 
-
-    folder_id = os.environ.get(
-        "DRIVE_FOLDER_ID"
-    )
-
-
-    google_credentials = os.environ.get(
-        "GOOGLE_SERVICE_ACCOUNT_JSON"
-    )
-
-
-    if google_credentials and folder_id:
-
-        print(
-            "Connecting to Google Drive..."
-        )
-
-
-        try:
-
-            drive_service = (
-                get_drive_service()
-            )
-
-
-            print(
-                "Google Drive connection successful."
-            )
-
-
-        except Exception as e:
-
-            print(
-                f"Google Drive connection failed: {e}"
-            )
-
-            drive_service = None
-
-
-    else:
-
-        print(
-            "Google Drive upload is NOT available."
-        )
-
-        if not google_credentials:
-
-            print(
-                "   Missing secret: GOOGLE_SERVICE_ACCOUNT_JSON"
-            )
-
-        if not folder_id:
-
-            print(
-                "   Missing secret: DRIVE_FOLDER_ID"
-            )
-
-
-    # --------------------------------------------------------
-    # Start Playwright
-    # --------------------------------------------------------
+    run_timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     with sync_playwright() as p:
-
-        browser = p.chromium.launch(
-            headless=True
-        )
-
-
+        # Always headless: this runs on GitHub's servers, which have no
+        # display. Debug mode still works -- it saves a screenshot and
+        # the before/after page text to output/debug/ so you can inspect
+        # the result afterward instead of watching a live browser window.
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
+        for station in stations:
+            url_id = station["url_id"]
+            name = station["name"]
+            print(f"-> {name} (url_id={url_id})")
 
-        # ----------------------------------------------------
-        # Process stations
-        # ----------------------------------------------------
-
-        for station_number, station in enumerate(
-            stations_to_process,
-            start=1,
-        ):
-
-            # ------------------------------------------------
-            # Read station information
-            # ------------------------------------------------
-
-            url_id = str(
-                station.get(
-                    "url_id",
-                    ""
-                )
-            ).strip()
-
-
-            station_index = str(
-                station.get(
-                    "station_index",
-                    ""
-                )
-            ).strip()
-
-
-            station_name = str(
-                station.get(
-                    "station_name",
-                    station.get(
-                        "name",
-                        ""
-                    ),
-                )
-            ).strip()
-
-
-            if not url_id:
-
-                print(
-                    f"\n[{station_number}] "
-                    f"ERROR: Station has no url_id."
-                )
-
-                continue
-
-
-            # ------------------------------------------------
-            # Display station
-            # ------------------------------------------------
-
-            print(
-                "\n--------------------------------------------------"
-            )
-
-            print(
-                f"[{station_number}/{len(stations_to_process)}] "
-                f"{station_index} - {station_name}"
-            )
-
-            print(
-                f"URL ID: {url_id}"
-            )
-
-
-            # ------------------------------------------------
-            # Construct DHM URL
-            # ------------------------------------------------
-
-            url = STATION_URL.format(
-                url_id
-            )
-
-
-            print(
-                f"Opening: {url}"
-            )
-
-
-            # ------------------------------------------------
-            # Debug filename
-            # ------------------------------------------------
-
-            debug_tag = None
-
-            if DEBUG_STATIONS:
-
-                debug_tag = (
-                    f"{station_index}_{url_id}"
-                )
-
-
-            # ------------------------------------------------
-            # Open station page
-            # ------------------------------------------------
+            filename = safe_filename(name, station.get("station_index"), url_id)
+            filepath = os.path.join(OUTPUT_DIR, filename)
 
             try:
-
-                page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-
+                page.goto(STATION_URL.format(url_id), timeout=20000)
+                debug_tag = f"{url_id}_{re.sub(r'[^\w-]+', '_', name)}" if DEBUG_STATIONS else None
+                history = extract_rainfall_history(page, debug_tag=debug_tag)
             except Exception as e:
+                print(f"   failed: {e}")
+                history = []
 
-                print(
-                    f"   ERROR opening page: {e}"
-                )
+            print(f"   read {len(history)} day(s): {history}")
 
-                continue
+            existing_dates = get_existing_dates(filepath)
+            new_entries = [(d, v) for d, v in history if d not in existing_dates]
 
-
-            # ------------------------------------------------
-            # Extract rainfall
-            # ------------------------------------------------
-
-            try:
-
-                value = extract_daily_rainfall(
-                    page,
-                    debug_tag=debug_tag,
-                )
-
-            except Exception as e:
-
-                print(
-                    f"   ERROR extracting rainfall: {e}"
-                )
-
-                value = None
-
-
-            # ------------------------------------------------
-            # If rainfall was successfully extracted
-            # ------------------------------------------------
-
-            if value is not None:
-
-                # --------------------------------------------
-                # Excel filename
-                # --------------------------------------------
-
-                filename = safe_filename(
-                    station_name,
-                    station_index,
-                    url_id,
-                )
-
-
-                # --------------------------------------------
-                # Local Excel path
-                # --------------------------------------------
-
-                filepath = os.path.join(
-                    OUTPUT_DIR,
-                    filename,
-                )
-
-
-                # --------------------------------------------
-                # Write/update Excel
-                # --------------------------------------------
-
-                try:
-
-                    write_station_excel(
-                        filepath,
-                        date_str,
-                        value,
-                    )
-
-
-                    print(
-                        f"   Excel saved: {filepath}"
-                    )
-
-
-                except Exception as e:
-
-                    print(
-                        f"   ERROR saving Excel: {e}"
-                    )
-
-                    continue
-
-
-                # --------------------------------------------
-                # Upload/update Google Drive
-                # --------------------------------------------
-
-                if (
-                    drive_service
-                    and folder_id
-                ):
-
-                    try:
-
-                        upload_to_drive(
-                            drive_service,
-                            folder_id,
-                            filepath,
-                            filename,
-                        )
-
-
-                    except Exception as e:
-
-                        print(
-                            "   Drive upload failed: "
-                            f"{e}"
-                        )
-
-
-                else:
-
-                    print(
-                        "   Google Drive upload skipped."
-                    )
-
-
+            if new_entries:
+                append_new_rows(filepath, new_entries, run_timestamp)
+                print(f"   added {len(new_entries)} new day(s): {sorted(new_entries)}")
             else:
+                print("   no new days to add (all already recorded, or nothing parsed)")
 
-                print(
-                    "   No rainfall value extracted."
-                )
+            if drive_service and new_entries:
+                try:
+                    upload_to_drive(drive_service, folder_id, filepath, filename)
+                except Exception as e:
+                    print(f"   drive upload failed: {e}")
 
-
-        # ----------------------------------------------------
-        # Close browser
-        # ----------------------------------------------------
+            time.sleep(0.5)  # be polite to the server
 
         browser.close()
 
+    print("Done.")
 
-    # --------------------------------------------------------
-    # Finish
-    # --------------------------------------------------------
-
-    print(
-        "\n=================================================="
-    )
-
-    print(
-        "Rainfall extraction completed."
-    )
-
-    print(
-        "=================================================="
-    )
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
-
     main()

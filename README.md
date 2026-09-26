@@ -18,9 +18,13 @@ the one part that may need adjusting, and it's a single button click.
    ids, coordinates) from DHM's plain HTML pages. Runs once, in the
    cloud, via the "Discover Stations" workflow.
 2. `main.py` — for each station, opens its page, selects "Daily",
-   clicks VIEW, reads the rainfall figure, appends it to
-   `output/<station>.xlsx`, and uploads/updates that file in a Google
-   Drive folder.
+   clicks VIEW, and reads the last 8 days of rainfall figures shown
+   there. It skips any date already saved in `output/<station>.xlsx`
+   and appends only the new ones, then uploads/updates that file in a
+   Google Drive folder — only when there's something new to add. Since
+   each run re-reads the last 8 days, a missed scheduled run (site
+   down, GitHub hiccup, etc.) gets backfilled automatically the next
+   time it runs successfully.
 3. `.github/workflows/rainfall.yml` — runs `main.py` automatically
    twice a day, for free, on GitHub's servers.
 4. `.github/workflows/discover.yml` and `.github/workflows/debug.yml`
@@ -61,16 +65,16 @@ straight into your repo automatically — nothing to download.
 
 ## Step 4 — Sanity-check the scraper before trusting it (one click)
 Go to **Actions** → **Debug Rainfall Extraction** → **Run workflow**
-(leave station_count at 3). When it finishes, open the run and download
-the **debug-output** artifact zip from the bottom of the page. Inside,
-for each station, compare the screenshot to the matching `.txt` file
-and confirm the "24h rainfall" number printed in the log actually
-matches what the page shows. If it's picking up the wrong number, open
-`main.py` on GitHub (click the pencil/edit icon), find
-`extract_daily_rainfall()`, and adjust it based on what's in the
-`.txt` file — the new text that appeared right after clicking VIEW is
-right there for you to read. Commit the change and re-run the debug
-workflow to confirm the fix.
+(leave station_count at 3). When it finishes, open the run's logs and
+check the printed `read N day(s): [...]` line for each station against
+the **debug-output** artifact zip (download it from the bottom of the
+run page). For each station, open its `.txt` file, find the real
+8-day table text, and confirm the (date, value) pairs logged actually
+match what's on the page — right dates, right numbers, nothing missed
+or duplicated. If it's off, open `main.py` on GitHub (pencil icon),
+find `extract_rainfall_history()`, and adjust the date/number parsing
+using that `.txt` file as your reference. Commit the change and re-run
+the debug workflow to confirm the fix.
 
 ## Step 5 — Add secrets and go live
 In your repo's **Settings → Secrets and variables → Actions**, add:
