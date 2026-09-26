@@ -131,7 +131,11 @@ def set_period_to_daily(page):
     ]
     for selector in selectors:
         try:
-            page.click(selector, timeout=2000)
+            # .first avoids an error (silently skipped by the except
+            # below) if this selector happens to match more than one
+            # element anywhere on the page -- plain page.click() on an
+            # ambiguous selector throws instead of just picking one.
+            page.locator(selector).first.click(timeout=2000)
             return True
         except Exception:
             continue
@@ -191,9 +195,16 @@ def extract_rainfall_history(page, debug_tag=None):
     """
     period_set_ok = set_period_to_daily(page)
 
+    if debug_tag:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        try:
+            page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}_after_daily_click.png"))
+        except Exception:
+            pass
+
     for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
         try:
-            page.click(selector, timeout=3000)
+            page.locator(selector).first.click(timeout=3000)
             break
         except Exception:
             continue
@@ -227,21 +238,14 @@ def extract_rainfall_history(page, debug_tag=None):
     return kept_rows
 
 
-def get_existing_dates(path):
-    if not os.path.exists(path):
-        return set()
-    wb = load_workbook(path)
-    ws = wb.active
-    dates = set()
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row and row[0]:
-            dates.add(str(row[0]))
-    return dates
-
-
-def append_new_rows(path, new_entries, run_timestamp):
-    """new_entries: list of (date_str, daily_value, total_value) tuples
-    NOT already in the file. Appends one row per entry and saves."""
+def append_all_rows(path, entries, run_timestamp):
+    """DEDUP DISABLED (per request, while still debugging / before the
+    storage destination -- Drive, GitHub, wherever -- is finalized):
+    every row read from the page gets written every run, no skip-if-
+    already-there check. This WILL create duplicate date rows across
+    multiple runs. Re-add a get_existing_dates()-style filter here once
+    you're ready to stop debugging and want the file to hold one row
+    per date instead of one row per run."""
     if os.path.exists(path):
         wb = load_workbook(path)
         ws = wb.active
@@ -250,7 +254,7 @@ def append_new_rows(path, new_entries, run_timestamp):
         ws = wb.active
         ws.append(["Date", "Daily Rainfall (mm)", "Running Total on page (mm)", "First recorded (UTC)"])
 
-    for date_str, daily_val, total_val in sorted(new_entries):
+    for date_str, daily_val, total_val in sorted(entries):
         ws.append([date_str, daily_val, total_val, run_timestamp])
 
     wb.save(path)
@@ -285,7 +289,22 @@ def main():
             filepath = os.path.join(OUTPUT_DIR, filename)
 
             try:
-                page.goto(STATION_URL.format(url_id), timeout=20000)
+                # wait_until="load" (the default) waits for EVERY
+                # resource on the page to finish, which can time out on
+                # a slow government server even when the content we
+                # need is already there. "domcontentloaded" is faster
+                # and more reliable here; one retry covers a one-off
+                # slow response.
+                try:
+                    page.goto(STATION_URL.format(url_id), timeout=30000, wait_until="domcontentloaded")
+                except Exception:
+                    print("   goto timed out once, retrying...")
+                    page.goto(STATION_URL.format(url_id), timeout=30000, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_selector("text=VIEW", timeout=15000)
+                except Exception:
+                    pass  # fall through; extract_rainfall_history's own
+                          # waits/selectors will surface the real problem
                 debug_tag = None
                 if DEBUG_STATIONS:
                     clean_name_for_tag = re.sub(r"[^\w-]+", "_", name)
@@ -297,14 +316,11 @@ def main():
 
             print(f"   read {len(history)} row(s): {history}")
 
-            existing_dates = get_existing_dates(filepath)
-            new_entries = [(d, daily, total) for d, daily, total in history if d not in existing_dates]
-
-            if new_entries:
-                append_new_rows(filepath, new_entries, run_timestamp)
-                print(f"   added {len(new_entries)} new row(s): {sorted(new_entries)}")
+            if history:
+                append_all_rows(filepath, history, run_timestamp)
+                print(f"   wrote {len(history)} row(s) (dedup disabled -- see append_all_rows)")
             else:
-                print("   no new rows to add (all already recorded, or nothing parsed)")
+                print("   nothing parsed, nothing written")
 
             # Google Drive upload is disabled for now -- output/*.xlsx is
             # available as a downloadable workflow artifact instead. To
