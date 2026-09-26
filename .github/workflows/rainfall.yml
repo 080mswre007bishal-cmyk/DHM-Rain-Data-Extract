@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  google-test:
+  google-write-test:
     runs-on: ubuntu-latest
 
     steps:
@@ -29,6 +29,6 @@ jobs:
           printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
           printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
 
-      - name: Create Google Sheet
+      - name: Test Google Sheet write
         run: |
-          python create_google_sheet.py
+          python google_write_test.py
