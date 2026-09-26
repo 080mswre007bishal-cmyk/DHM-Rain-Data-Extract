@@ -2,44 +2,45 @@
 main.py
 -------
 For every station in stations.json:
-  1. Open its DHM page in a headless browser
-     (dhm.gov.np/hydrology/rainfallSingle/<id> -- confirmed to carry the
-     same "Date / Period / VIEW / Accumulated Rainfall" widget as the
-     rainfall-watch-map page, via a screenshot you shared).
-  2. Set the Date field to YESTERDAY (Nepal time), because today's
-     figure is still updating throughout the day.
-  3. Set Period to "Daily" and click VIEW. This reveals a table with
-     three columns: Date, Daily (mm), Total (mm) -- Total is just the
-     running sum of Daily across the visible rows.
-  4. Read every row of that table.
-  5. For each station's output/<station>.xlsx, skip any date already
-     recorded and append only the new ones. Running this twice, or
-     missing a scheduled run, does not create duplicates and
-     self-heals small gaps, since each run re-reads the whole visible
-     window (usually the last 8 days).
+  1. Go to the DHM rainfall-watch-map page.
+  2. In the "SORT & FILTERS" panel, set Filter type to "Station No."
+     and pick this station's own Station Index in the Station Number
+     dropdown, then click "Apply Filter" -- this targets the exact
+     right station instead of guessing among ~700+ map markers.
+  3. Click the marker that appears/gets highlighted.
+  4. In the popup panel that opens (CONFIRMED via a real screenshot
+     you shared of the Thakmarpha popup): select "Daily" in the Period
+     dropdown (a real <select> here, unlike the broken tab-style
+     control on the standalone rainfallSingle/<id> page), click VIEW,
+     and read the resulting Date | Daily | Total table.
+  5. Skip today's row (still accumulating) and write the rest to
+     output/<station>.xlsx. Dedup is currently OFF (per earlier
+     request, while still debugging) -- every row gets written every
+     run.
 
-Google Drive upload is DISABLED for now, per your request -- focus is
-on getting the extraction right first. The functions are still here,
-commented out of the main loop, so it's a one-line change to turn
-back on later. In the meantime, output/*.xlsx is picked up by the
-"Upload run artifacts" step already in rainfall.yml, so you can
-download it from the Actions run summary page after every run.
+IMPORTANT -- what's confirmed vs. not:
+CONFIRMED: the popup panel's Period control is a real <select>
+(screenshot), and its resulting table has Date/Daily/Total columns
+with the same date format as before ("Fri, Sep 25, 2026, 12:00 AM").
+NOT CONFIRMED (I cannot load dhm.gov.np myself, so this is
+best-effort): the exact selectors for the "Filter type" dropdown, the
+"Station Number" dropdown, the "Apply Filter" button, and whether
+clicking Apply Filter alone opens the popup or whether the marker
+still needs a separate click afterward.
 
-IMPORTANT -- what's confirmed vs. not (this has already been through
-one debug round with real output, see the comments in
-set_period_to_daily() and extract_rainfall_history() below for what
-that revealed):
-CONFIRMED: the table's three columns (Date, Daily, Total) and their
-date format ("Fri, Sep 25, 2026, 12:00 AM"); that Period is a row of
-clickable tabs (Point / Hourly / Daily / Point for 7 days), NOT a
-dropdown; and that the Date field defaults to today, so today's row
-is filtered out after extraction rather than trying to set the field.
-STILL NOT FULLY CONFIRMED: whether clicking "Daily" reliably lands on
-that tab every time (vs. some other tab/label elsewhere on the page
-also matching). Run DEBUG_STATIONS=3 and check output/debug/*.txt --
-specifically the "all_rows_extracted" line and whether the real page
-text's table header reads "Date Daily Total" (correct) rather than
-"Date Point" (still wrong) -- before trusting a live run.
+Run DEBUG_STATIONS=3 (or the Debug Rainfall Extraction workflow) and
+check output/debug/ for each station:
+  - <tag>_after_filter.png       -- what the map looked like right
+                                     after clicking Apply Filter
+  - <tag>_sidebar_html.txt       -- the real HTML of the filter
+                                     sidebar, if filtering failed
+  - <tag>_panel.png / _panel_html.txt -- the popup panel, if one
+                                     was found
+  - <tag>.txt                    -- the full log: what got clicked,
+                                     what rows got read
+If Apply Filter or the marker click isn't landing, the sidebar/panel
+HTML dumps are what to paste back for a real fix, the same way that
+worked for the Daily-tab bug on the old page.
 
 Usage:
     pip install playwright openpyxl
@@ -59,19 +60,15 @@ from playwright.sync_api import sync_playwright
 STATIONS_FILE = "stations.json"
 OUTPUT_DIR = "output"
 DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
-STATION_URL = "https://dhm.gov.np/hydrology/rainfallSingle/{}"
+MAP_URL = "https://dhm.gov.np/hydrology/rainfall-watch-map"
 
-# Set via env var for a quick test, e.g. DEBUG_STATIONS=3 python main.py
 DEBUG_STATIONS = int(os.environ.get("DEBUG_STATIONS", "0"))
 
-# Nepal is UTC+5:45.
 NEPAL_OFFSET = datetime.timedelta(hours=5, minutes=45)
 
-# Date formats confirmed / guessed for parsing table cells and the top
-# Date field. Confirmed format is first.
 DATE_FORMATS = [
-    "%a, %b %d, %Y, %I:%M %p",   # Fri, Sep 25, 2026, 12:00 AM  (confirmed)
-    "%Y-%m-%d",                   # 2026-09-25
+    "%a, %b %d, %Y, %I:%M %p",
+    "%Y-%m-%d",
     "%d %b, %Y", "%d %B, %Y", "%d %b %Y", "%d %B %Y",
     "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
 ]
@@ -113,48 +110,178 @@ def parse_number(text):
     return val if 0 <= val < 1000 else None
 
 
-def set_period_to_daily(page):
-    """Click the 'Daily' tab among Point / Hourly / Daily / Point for 7
-    days. CONFIRMED (from a real debug run): Period is a row of plain
-    clickable tabs, not a <select> dropdown -- an earlier version of
-    this code tried select_option() first, which silently matched some
-    unrelated hidden <select> on the page and reported false success,
-    while the page's actual Period stayed on its default, "Point" (the
-    raw 10-minute AWS feed). Exact match ("Daily") is tried first to
-    avoid accidentally matching "Point for 7 days"."""
+def save_debug_file(tag, suffix, content):
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    safe = re.sub(r"[^\w.-]+", "_", tag)
+    with open(os.path.join(DEBUG_DIR, f"{safe}{suffix}"), "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def dump_element_html(page_or_panel, text_to_find):
+    """Find the DOM node whose exact text is text_to_find, walk up a few
+    parent levels, and return that outerHTML. Returns a message string
+    if not found."""
+    try:
+        return page_or_panel.evaluate(
+            """(target) => {
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node;
+                while (node = walker.nextNode()) {
+                    if (node.textContent.trim() === target) {
+                        let el = node.parentElement;
+                        for (let i = 0; i < 4 && el.parentElement; i++) {
+                            el = el.parentElement;
+                        }
+                        return el.outerHTML;
+                    }
+                }
+                return 'NO NODE WITH EXACT TEXT "' + target + '" FOUND';
+            }""",
+            text_to_find,
+        )
+    except Exception as e:
+        return f"ERROR while extracting: {e}"
+
+
+def open_station_via_filter(page, station_index, debug_tag=None):
+    """Set Filter type to Station No., pick station_index in the
+    Station Number dropdown, click Apply Filter. Returns True/False."""
+    selects = page.locator("select")
+    filter_type_ok = False
+    station_number_ok = False
+
+    try:
+        for i in range(selects.count()):
+            sel = selects.nth(i)
+            opts = [o.strip() for o in sel.locator("option").all_inner_texts()]
+            if any("station no" in o.lower() for o in opts):
+                match = next(o for o in opts if "station no" in o.lower())
+                sel.select_option(label=match, timeout=2000)
+                filter_type_ok = True
+                break
+    except Exception:
+        pass
+
+    try:
+        selects = page.locator("select")  # re-query; DOM may have changed
+        for i in range(selects.count()):
+            sel = selects.nth(i)
+            opts = [o.strip() for o in sel.locator("option").all_inner_texts()]
+            if station_index in opts:
+                sel.select_option(label=station_index, timeout=2000)
+                station_number_ok = True
+                break
+    except Exception:
+        pass
+
+    apply_ok = False
+    for selector in ["button:has-text('Apply Filter')", "text='Apply Filter'", "input[value='Apply Filter']"]:
+        try:
+            page.locator(selector).first.click(timeout=3000)
+            apply_ok = True
+            break
+        except Exception:
+            continue
+
+    if debug_tag:
+        try:
+            page.wait_for_timeout(1500)
+            page.screenshot(path=os.path.join(DEBUG_DIR, f"{re.sub(r'[^\\w.-]+', '_', debug_tag)}_after_filter.png"))
+        except Exception:
+            pass
+        if not (filter_type_ok and station_number_ok and apply_ok):
+            save_debug_file(debug_tag, "_sidebar_html.txt", dump_element_html(page, "Apply Filter"))
+
+    return filter_type_ok and station_number_ok and apply_ok
+
+
+def get_marker_locator(page):
+    for selector in ["#map .leaflet-marker-icon", ".leaflet-container .leaflet-marker-icon"]:
+        loc = page.locator(selector)
+        try:
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+    return None
+
+
+def _candidate_panels(page):
     selectors = [
-        "text='Daily'",
-        "button:has-text('Daily')",
-        "a:has-text('Daily')",
-        "li:has-text('Daily')",
-        "label:has-text('Daily')",
+        "[role='dialog']:visible",
+        ".modal.show:visible", ".modal.in:visible",
+        ".offcanvas.show:visible",
+        "div[class*='station']:visible", "section[class*='station']:visible",
+        "div[class*='popup']:visible", "section[class*='popup']:visible",
     ]
+    result = []
     for selector in selectors:
         try:
-            # .first avoids an error (silently skipped by the except
-            # below) if this selector happens to match more than one
-            # element anywhere on the page -- plain page.click() on an
-            # ambiguous selector throws instead of just picking one.
-            page.locator(selector).first.click(timeout=2000)
+            loc = page.locator(selector)
+            for i in range(loc.count()):
+                el = loc.nth(i)
+                try:
+                    if not el.is_visible():
+                        continue
+                    inside_map = el.evaluate("el => !!el.closest('.leaflet-container')")
+                    if inside_map:
+                        continue
+                    txt = el.inner_text(timeout=1000)
+                    if "station index" in txt.lower() and "view" in txt.lower():
+                        result.append(el)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return result
+
+
+def find_station_panel(page):
+    panels = _candidate_panels(page)
+    if not panels:
+        return None
+    ranked = sorted(panels, key=lambda p: len(p.inner_text()))
+    return ranked[0]
+
+
+def set_period_to_daily_in_panel(panel):
+    """Real <select>-based Period control, scoped to just this panel
+    (confirmed via your Thakmarpha popup screenshot)."""
+    selects = panel.locator("select")
+    for i in range(selects.count()):
+        sel = selects.nth(i)
+        try:
+            opts = [o.strip() for o in sel.locator("option").all_inner_texts()]
+            if any(o.lower() == "daily" for o in opts):
+                sel.select_option(label="Daily", timeout=2000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def click_view_in_panel(panel):
+    for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
+        try:
+            panel.locator(selector).first.click(timeout=3000)
             return True
         except Exception:
             continue
     return False
 
 
-def table_rows_from_page(page):
-    """Read the Accumulated Rainfall table: Date | Daily | Total.
-    Returns a list of (date_str, daily_value, total_value)."""
+def table_rows_from_panel(panel):
     rows_data = []
     try:
-        rows = page.query_selector_all("table tr")
+        rows = panel.locator("table tr")
+        count = rows.count()
     except Exception:
-        rows = []
+        return rows_data
 
-    for row in rows:
+    for i in range(count):
         try:
-            cells = row.query_selector_all("td, th")
-            texts = [c.inner_text().strip() for c in cells]
+            cells = rows.nth(i).locator("td, th")
+            texts = [cells.nth(j).inner_text().strip() for j in range(cells.count())]
         except Exception:
             continue
 
@@ -173,79 +300,99 @@ def table_rows_from_page(page):
 
         daily_val = parse_number(texts[1]) if len(texts) > 1 else None
         total_val = parse_number(texts[2]) if len(texts) > 2 else None
-
         if daily_val is not None:
             rows_data.append((date_str, daily_val, total_val))
 
     return rows_data
 
 
-def extract_rainfall_history(page, debug_tag=None):
-    """
-    Clicks the "Daily" period tab and VIEW, then reads the resulting
-    table (Date | Daily | Total).
+def close_any_panel(page):
+    for selector in [
+        "[aria-label='Close']:visible", "button[title='Close']:visible",
+        ".btn-close:visible", ".close:visible", "button:has-text('Close'):visible",
+    ]:
+        try:
+            loc = page.locator(selector).last
+            if loc.is_visible():
+                loc.click(force=True, timeout=1000)
+                page.wait_for_timeout(250)
+                return
+        except Exception:
+            pass
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(250)
+    except Exception:
+        pass
 
-    Doesn't touch the Date field: it's confirmed to default to today,
-    and rather than fight an unconfirmed date-picker element, today's
-    row (which may still be accumulating) is simply filtered out of
-    the result below instead.
 
-    Returns a list of (date_str, daily_value, total_value) tuples,
-    excluding today's row.
-    """
-    period_set_ok = set_period_to_daily(page)
+def process_station(page, station, debug_tag=None):
+    """Returns list of (date_str, daily_value, total_value), excluding
+    today's row. Raises on failure."""
+    station_index = station.get("station_index")
+    if not station_index:
+        raise RuntimeError("This station has no station_index in stations.json -- can't filter by it.")
+
+    page.goto(MAP_URL, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(2000)
+
+    filtered_ok = open_station_via_filter(page, station_index, debug_tag=debug_tag)
+    if not filtered_ok:
+        raise RuntimeError(f"Could not apply the Station No. filter for index {station_index!r}.")
+
+    panel = None
+    for _ in range(20):
+        panel = find_station_panel(page)
+        if panel is not None:
+            break
+        # Popup may need an explicit marker click after filtering.
+        markers = get_marker_locator(page)
+        if markers and markers.count() > 0:
+            try:
+                markers.first.click(force=True, timeout=2000)
+            except Exception:
+                pass
+        time.sleep(0.5)
+
+    if panel is None:
+        if debug_tag:
+            page.screenshot(path=os.path.join(DEBUG_DIR, f"{re.sub(r'[^\\w.-]+', '_', debug_tag)}_no_panel.png"))
+        raise RuntimeError("Filtered successfully but no station popup panel appeared.")
 
     if debug_tag:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
         try:
-            page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}_after_daily_click.png"))
+            panel.screenshot(path=os.path.join(DEBUG_DIR, f"{re.sub(r'[^\\w.-]+', '_', debug_tag)}_panel.png"))
+        except Exception:
+            pass
+        try:
+            save_debug_file(debug_tag, "_panel_html.txt", panel.evaluate("el => el.outerHTML"))
         except Exception:
             pass
 
-    for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
-        try:
-            page.locator(selector).first.click(timeout=3000)
-            break
-        except Exception:
-            continue
+    period_ok = set_period_to_daily_in_panel(panel)
+    view_ok = click_view_in_panel(panel)
+    panel.page.wait_for_timeout(2000) if hasattr(panel, "page") else time.sleep(2)
 
-    try:
-        page.wait_for_selector("text=Accumulated Rainfall", timeout=8000)
-    except Exception:
-        pass
-    try:
-        page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        page.wait_for_timeout(3000)
-
-    all_rows = table_rows_from_page(page)
+    all_rows = table_rows_from_panel(panel)
     today = nepal_today_iso()
     kept_rows = [r for r in all_rows if r[0] != today]
-    skipped_today = [r for r in all_rows if r[0] == today]
 
     if debug_tag:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
-        page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}.png"))
-        with open(os.path.join(DEBUG_DIR, f"{debug_tag}.txt"), "w", encoding="utf-8") as f:
-            f.write(f"period_set_ok (clicked 'Daily' tab): {period_set_ok}\n")
-            f.write(f"today (Nepal): {today}\n")
-            f.write(f"all_rows_extracted: {all_rows}\n")
-            f.write(f"skipped_today_row (still accumulating): {skipped_today}\n")
-            f.write(f"kept_rows (written to Excel): {kept_rows}\n\n")
-            f.write("=== FULL PAGE TEXT AFTER VIEW ===\n")
-            f.write(page.inner_text("body"))
+        save_debug_file(
+            debug_tag, "_result.txt",
+            f"filtered_ok: {filtered_ok}\n"
+            f"period_ok (selected Daily): {period_ok}\n"
+            f"view_ok (clicked VIEW): {view_ok}\n"
+            f"all_rows: {all_rows}\n"
+            f"kept_rows: {kept_rows}\n"
+        )
 
+    close_any_panel(page)
     return kept_rows
 
 
 def append_all_rows(path, entries, run_timestamp):
-    """DEDUP DISABLED (per request, while still debugging / before the
-    storage destination -- Drive, GitHub, wherever -- is finalized):
-    every row read from the page gets written every run, no skip-if-
-    already-there check. This WILL create duplicate date rows across
-    multiple runs. Re-add a get_existing_dates()-style filter here once
-    you're ready to stop debugging and want the file to hold one row
-    per date instead of one row per run."""
+    """Dedup disabled while debugging -- every row gets written every run."""
     if os.path.exists(path):
         wb = load_workbook(path)
         ws = wb.active
@@ -269,47 +416,30 @@ def main():
     if DEBUG_STATIONS:
         stations = stations[:DEBUG_STATIONS]
         print(f"DEBUG MODE: running only {len(stations)} station(s)")
+    else:
+        print(f"LIVE RUN: processing all {len(stations)} station(s) in {STATIONS_FILE}.")
 
     run_timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     with sync_playwright() as p:
-        # Always headless: this runs on GitHub's servers, which have no
-        # display. Debug mode still works -- it saves a screenshot and
-        # the page text/state to output/debug/ so you can inspect the
-        # result afterward instead of watching a live browser window.
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         for station in stations:
             url_id = station["url_id"]
             name = station["name"]
-            print(f"-> {name} (url_id={url_id})")
+            print(f"-> {name} (station_index={station.get('station_index')})")
 
             filename = safe_filename(name, station.get("station_index"), url_id)
             filepath = os.path.join(OUTPUT_DIR, filename)
 
+            debug_tag = None
+            if DEBUG_STATIONS:
+                clean_name_for_tag = re.sub(r"[^\w-]+", "_", name)
+                debug_tag = f"{url_id}_{clean_name_for_tag}"
+
             try:
-                # wait_until="load" (the default) waits for EVERY
-                # resource on the page to finish, which can time out on
-                # a slow government server even when the content we
-                # need is already there. "domcontentloaded" is faster
-                # and more reliable here; one retry covers a one-off
-                # slow response.
-                try:
-                    page.goto(STATION_URL.format(url_id), timeout=30000, wait_until="domcontentloaded")
-                except Exception:
-                    print("   goto timed out once, retrying...")
-                    page.goto(STATION_URL.format(url_id), timeout=30000, wait_until="domcontentloaded")
-                try:
-                    page.wait_for_selector("text=VIEW", timeout=15000)
-                except Exception:
-                    pass  # fall through; extract_rainfall_history's own
-                          # waits/selectors will surface the real problem
-                debug_tag = None
-                if DEBUG_STATIONS:
-                    clean_name_for_tag = re.sub(r"[^\w-]+", "_", name)
-                    debug_tag = f"{url_id}_{clean_name_for_tag}"
-                history = extract_rainfall_history(page, debug_tag=debug_tag)
+                history = process_station(page, station, debug_tag=debug_tag)
             except Exception as e:
                 print(f"   failed: {e}")
                 history = []
@@ -318,16 +448,11 @@ def main():
 
             if history:
                 append_all_rows(filepath, history, run_timestamp)
-                print(f"   wrote {len(history)} row(s) (dedup disabled -- see append_all_rows)")
+                print(f"   wrote {len(history)} row(s) (dedup disabled)")
             else:
                 print("   nothing parsed, nothing written")
 
-            # Google Drive upload is disabled for now -- output/*.xlsx is
-            # available as a downloadable workflow artifact instead. To
-            # re-enable later, restore get_drive_service()/upload_to_drive()
-            # from the previous version and call them here.
-
-            time.sleep(0.5)  # be polite to the server
+            time.sleep(0.5)
 
         browser.close()
 
