@@ -1,4 +1,4 @@
+requests
+beautifulsoup4
 playwright
 openpyxl
-numpy
-opencv-python-headless
