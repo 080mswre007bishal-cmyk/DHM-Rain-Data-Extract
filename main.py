@@ -230,7 +230,7 @@ def _candidate_panels(root):
                     low = txt.lower()
                     # CHANGED: broader acceptance - "station index" is the
                     # key marker; require an action or period hint too.
-                    if "station index" in low and ("view" in low or "daily" in low or "period" in low):
+                    if "station index" in low and "view" in low:
                         sig = (el.evaluate("el => el.tagName + '|' + (el.id || '') + '|' + (el.className || '')"), len(txt))
                         if sig in seen:
                             continue
@@ -248,15 +248,32 @@ def visible_station_panel(page):
     panels = _candidate_panels(page)
     if not panels:
         return None
-    # CHANGED: prefer panels OUTSIDE the map (smallest text first), but
-    # accept an in-map Leaflet popup as a fallback instead of returning None.
-    outside = [(len(p.inner_text()), p) for inside, p in panels if not inside]
-    inside = [(len(p.inner_text()), p) for is_in, p in panels if is_in]
-    for group in (outside, inside):
-        if group:
-            group.sort(key=lambda x: x[0])
-            return group[0][1]
-    return None
+
+    # CHANGED: the panel MUST contain the form (a <select> or a VIEW button).
+    # Previously the smallest keyword-matching element was chosen, which for
+    # some stations was only the info box ("Station Index / Latitude...") with
+    # no form inside -> "Available selects/options: []" failures.
+    def has_form(p):
+        try:
+            if p.locator("select").count() > 0:
+                return True
+            if p.locator("button:has-text('VIEW'), input[value='VIEW'], a:has-text('VIEW')").count() > 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    ranked = []
+    for inside_map, p in panels:
+        try:
+            ranked.append((inside_map, not has_form(p), len(p.inner_text()), p))
+        except Exception:
+            pass
+    if not ranked:
+        return None
+    # outside-map first, form-containing first, then smallest text
+    ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+    return ranked[0][3]
 
 
 def _normal_text(text):
@@ -287,7 +304,7 @@ def _extract_station_name(text):
 
 def _extract_station_index(text):
     text = _normal_text(text)
-    m = re.search(r"\bStation\s*Index\s*[:\-]?\s*([A-Za-z0-9_-]+)", text, re.I)
+    m = re.search(r"\bStation\s*Index\s*[:\-]?\s*([A-Za-z0-9_-]*\d[A-Za-z0-9_-]*)", text, re.I)
     return m.group(1).strip() if m else None
 
 
@@ -525,23 +542,49 @@ def append_rows(path, rows):
     return added
 
 
+def _wait_station_panel(page, attempts=40, delay=0.25):
+    for _ in range(attempts):
+        panel = visible_station_panel(page)
+        if panel is not None:
+            return panel
+        time.sleep(delay)
+    return None
+
+
+def ensure_panel_closed(page, attempts=3):
+    # CHANGED: verify the popup is actually gone before clicking the next
+    # marker. An unclosed popup overlays the map and swallows marker clicks
+    # (this is what caused the repeated 'Tarakhola' reads).
+    for _ in range(attempts):
+        panel = visible_station_panel(page)
+        if panel is None:
+            return True
+        close_station_panel(page, panel)
+        page.wait_for_timeout(400)
+    return visible_station_panel(page) is None
+
+
 def process_marker(page, marker):
-    close_station_panel(page)
+    ensure_panel_closed(page)
     try:
         marker.scroll_into_view_if_needed(timeout=3000)
     except Exception:
         pass
-    try:
-        marker.click(force=True, timeout=5000)
-    except Exception:
-        marker.dispatch_event("click")
-
+    # CHANGED: dispatch_event("click") goes straight to Leaflet's DOM handler
+    # and cannot be intercepted by an open popup overlay. Coordinate click is
+    # only a fallback now (previously it was primary and could hit overlays).
     panel = None
-    for _ in range(40):
-        panel = visible_station_panel(page)
-        if panel is not None:
-            break
-        time.sleep(0.25)
+    try:
+        marker.dispatch_event("click")
+    except Exception:
+        pass
+    panel = _wait_station_panel(page, attempts=8, delay=0.25)
+    if panel is None:
+        try:
+            marker.click(force=True, timeout=5000)
+        except Exception:
+            marker.dispatch_event("click")
+        panel = _wait_station_panel(page)
     if panel is None:
         raise RuntimeError("Marker clicked, but no station popup appeared (checked both outside-map containers and Leaflet popups).")
 
@@ -560,7 +603,7 @@ def process_marker(page, marker):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print("======================================")
-    print("DHM Daily Rainfall Extractor (v2)")
+    print("DHM Daily Rainfall Extractor (v3)")
     print("======================================")
     print(f"Today (AD): {today_iso()}")
     print("All returned rows are saved EXCEPT today's row.")
@@ -643,7 +686,7 @@ def main():
                         print(f"    FAILED: {exc}")
                         save_debug(page, f"ERROR_marker_p{pass_no}_{i:04d}")
                     finally:
-                        close_station_panel(page)
+                        ensure_panel_closed(page)
                         time.sleep(0.4)
                 if new_in_pass == 0:
                     print(f"Pass {pass_no}: no new stations; stopping.")
