@@ -1,45 +1,34 @@
 name: DHM Rainfall Scrape
 
-# Runs main.py automatically twice a day, on GitHub's servers, for free.
-# Visits each station's own page (dhm.gov.np/hydrology/rainfallSingle/<id>,
-# via stations.json), sets Period to Daily, clicks VIEW, reads the
-# Date/Daily/Total table, and appends only new dates to
-# output/<station>.xlsx. Google Drive upload is currently disabled --
-# see the note near the bottom of main.py's main() function for how to
-# turn it back on. In the meantime, every run's output/*.xlsx files are
-# attached to that run as a downloadable artifact (see the last step
-# below).
-
 on:
-  schedule:
-    # Times are UTC. Nepal is UTC+5:45.
-    # 03:15 UTC = 09:00 NPT, 15:15 UTC = 21:00 NPT.
-    # Adjust to whenever DHM's daily reading is actually published if needed.
-    - cron: "15 3,15 * * *"
-  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
-  scrape:
+  google-test:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Google dependencies
         run: |
-          pip install -r requirements.txt
-          playwright install --with-deps chromium
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      - name: Run scraper
-        run: python main.py
+      - name: Restore Google credentials
+        shell: bash
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
+          printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
 
-      - name: Upload output (Excel files + debug, if any)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rainfall-output-${{ github.run_id }}
-          path: output/
-          retention-days: 30
+      - name: Test Google Drive and Sheets
+        run: |
+          python google_github_test.py
