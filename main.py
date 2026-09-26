@@ -1,321 +1,721 @@
 """
-main.py
--------
-For every station in stations.json:
-  1. Open its DHM page in a headless browser
-     (dhm.gov.np/hydrology/rainfallSingle/<id> -- confirmed to carry the
-     same "Date / Period / VIEW / Accumulated Rainfall" widget as the
-     rainfall-watch-map page, via a screenshot you shared).
-  2. Set the Date field to YESTERDAY (Nepal time), because today's
-     figure is still updating throughout the day.
-  3. Set Period to "Daily" and click VIEW. This reveals a table with
-     three columns: Date, Daily (mm), Total (mm) -- Total is just the
-     running sum of Daily across the visible rows.
-  4. Read every row of that table.
-  5. For each station's output/<station>.xlsx, skip any date already
-     recorded and append only the new ones. Running this twice, or
-     missing a scheduled run, does not create duplicates and
-     self-heals small gaps, since each run re-reads the whole visible
-     window (usually the last 8 days).
+DHM Rainfall Watch Map -> Daily station rainfall -> Excel
 
-Google Drive upload is DISABLED for now, per your request -- focus is
-on getting the extraction right first. The functions are still here,
-commented out of the main loop, so it's a one-line change to turn
-back on later. In the meantime, output/*.xlsx is picked up by the
-"Upload run artifacts" step already in rainfall.yml, so you can
-download it from the Actions run summary page after every run.
+Workflow:
+1. Open https://dhm.gov.np/hydrology/rainfall-watch-map
+2. Click "24 Hour".
+3. Click the station markers on the map and read the popup. The popup is
+   expected to contain a link to /hydrology/rainfallSingle/<id>.
+4. Open that station page.
+5. Set Date = yesterday (Nepal time), Period = Daily, click VIEW.
+6. Read the Accumulated Rainfall table.
+7. Append only dates not already present in output/*.xlsx.
 
-IMPORTANT -- what's confirmed vs. not (this has already been through
-one debug round with real output, see the comments in
-set_period_to_daily() and extract_rainfall_history() below for what
-that revealed):
-CONFIRMED: the table's three columns (Date, Daily, Total) and their
-date format ("Fri, Sep 25, 2026, 12:00 AM"); that Period is a row of
-clickable tabs (Point / Hourly / Daily / Point for 7 days), NOT a
-dropdown; and that the Date field defaults to today, so today's row
-is filtered out after extraction rather than trying to set the field.
-STILL NOT FULLY CONFIRMED: whether clicking "Daily" reliably lands on
-that tab every time (vs. some other tab/label elsewhere on the page
-also matching). Run DEBUG_STATIONS=3 and check output/debug/*.txt --
-specifically the "all_rows_extracted" line and whether the real page
-text's table header reads "Date Daily Total" (correct) rather than
-"Date Point" (still wrong) -- before trusting a live run.
-
-Usage:
+Install:
     pip install playwright openpyxl
     playwright install chromium
-    python main.py
+
+Useful environment variables:
+    DEBUG=1             save screenshots/html for troubleshooting
+    MAX_STATIONS=10     test only the first N discovered stations
+    HEADLESS=0          show the browser locally
 """
 
-import datetime
+import datetime as dt
 import json
 import os
 import re
 import time
+from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-STATIONS_FILE = "stations.json"
-OUTPUT_DIR = "output"
-DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
+
+MAP_URL = "https://dhm.gov.np/hydrology/rainfall-watch-map"
 STATION_URL = "https://dhm.gov.np/hydrology/rainfallSingle/{}"
 
-# Set via env var for a quick test, e.g. DEBUG_STATIONS=3 python main.py
-DEBUG_STATIONS = int(os.environ.get("DEBUG_STATIONS", "0"))
+OUTPUT_DIR = Path("output")
+DEBUG_DIR = OUTPUT_DIR / "debug"
 
-# Nepal is UTC+5:45.
-NEPAL_OFFSET = datetime.timedelta(hours=5, minutes=45)
+DEBUG = os.getenv("DEBUG", "0") == "1"
+HEADLESS = os.getenv("HEADLESS", "1") != "0"
+MAX_STATIONS = int(os.getenv("MAX_STATIONS", "0"))  # 0 = all
 
-# Date formats confirmed / guessed for parsing table cells and the top
-# Date field. Confirmed format is first.
+
+# ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
+
+NPT = dt.timezone(dt.timedelta(hours=5, minutes=45))
+
+
+def yesterday_npt():
+    return (dt.datetime.now(NPT).date() - dt.timedelta(days=1))
+
+
+def yesterday_iso():
+    return yesterday_npt().strftime("%Y-%m-%d")
+
+
 DATE_FORMATS = [
-    "%a, %b %d, %Y, %I:%M %p",   # Fri, Sep 25, 2026, 12:00 AM  (confirmed)
-    "%Y-%m-%d",                   # 2026-09-25
-    "%d %b, %Y", "%d %B, %Y", "%d %b %Y", "%d %B %Y",
-    "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+    "%a, %b %d, %Y, %I:%M %p",  # Fri, Sep 25, 2026, 12:00 AM
+    "%a, %b %d, %Y",
+    "%Y-%m-%d",
+    "%d %b, %Y",
+    "%d %B, %Y",
+    "%d %b %Y",
+    "%d %B %Y",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%d-%m-%Y",
 ]
-DATE_PATTERNS = [
-    r"[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}(?:,\s+\d{1,2}:\d{2}\s*[AP]M)?",
-    r"\d{4}-\d{2}-\d{2}",
-    r"\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}",
-    r"\d{1,2}/\d{1,2}/\d{4}",
-    r"\d{1,2}-\d{1,2}-\d{4}",
-]
 
 
-def safe_filename(name, station_index, url_id):
-    base = station_index or url_id
-    clean_name = re.sub(r"[^\w\-]+", "_", name).strip("_")
-    return f"{base}_{clean_name}.xlsx"
-
-
-def nepal_today_iso():
-    now_npt = datetime.datetime.utcnow() + NEPAL_OFFSET
-    return now_npt.date().strftime("%Y-%m-%d")
-
-
-def parse_date_token(token):
-    token = token.strip()
+def parse_date(text):
+    text = text.strip()
     for fmt in DATE_FORMATS:
         try:
-            return datetime.datetime.strptime(token, fmt).strftime("%Y-%m-%d")
+            return dt.datetime.strptime(text, fmt).strftime("%Y-%m-%d")
         except ValueError:
-            continue
+            pass
+
+    # Search inside a longer table cell.
+    patterns = [
+        r"[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}(?:,\s+\d{1,2}:\d{2}\s*[AP]M)?",
+        r"\d{4}-\d{2}-\d{2}",
+        r"\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}",
+        r"\d{1,2}/\d{1,2}/\d{4}",
+        r"\d{1,2}-\d{1,2}-\d{4}",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            for fmt in DATE_FORMATS:
+                try:
+                    return dt.datetime.strptime(m.group(0), fmt).strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
     return None
 
 
 def parse_number(text):
-    matches = re.findall(r"\d+\.\d+|\d+", text)
-    if not matches:
+    text = text.replace(",", "").strip()
+    if not text:
         return None
-    val = float(matches[0])
-    return val if 0 <= val < 1000 else None
+
+    # Prefer a decimal/integer token.
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
 
 
-def set_period_to_daily(page):
-    """Click the 'Daily' tab among Point / Hourly / Daily / Point for 7
-    days. CONFIRMED (from a real debug run): Period is a row of plain
-    clickable tabs, not a <select> dropdown -- an earlier version of
-    this code tried select_option() first, which silently matched some
-    unrelated hidden <select> on the page and reported false success,
-    while the page's actual Period stayed on its default, "Point" (the
-    raw 10-minute AWS feed). Exact match ("Daily") is tried first to
-    avoid accidentally matching "Point for 7 days"."""
-    selectors = [
-        "text='Daily'",
-        "button:has-text('Daily')",
-        "a:has-text('Daily')",
-        "li:has-text('Daily')",
-        "label:has-text('Daily')",
+# ---------------------------------------------------------------------------
+# General browser helpers
+# ---------------------------------------------------------------------------
+
+def save_debug(page, tag):
+    if not DEBUG:
+        return
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w.-]+", "_", tag)
+    page.screenshot(path=str(DEBUG_DIR / f"{safe}.png"), full_page=True)
+    (DEBUG_DIR / f"{safe}.html").write_text(
+        page.content(), encoding="utf-8"
+    )
+
+
+def click_text(page, text, timeout=8000):
+    """Click exact visible text, with a few fallbacks."""
+    candidates = [
+        page.get_by_text(text, exact=True).first,
+        page.locator(f"text={text}").first,
+        page.get_by_role("button", name=text, exact=True).first,
+        page.locator(f"a:has-text('{text}')").first,
+        page.locator(f"button:has-text('{text}')").first,
     ]
-    for selector in selectors:
+
+    for loc in candidates:
         try:
-            page.click(selector, timeout=2000)
+            loc.wait_for(state="visible", timeout=timeout)
+            loc.click()
             return True
         except Exception:
             continue
+
     return False
 
 
-def table_rows_from_page(page):
-    """Read the Accumulated Rainfall table: Date | Daily | Total.
-    Returns a list of (date_str, daily_value, total_value)."""
-    rows_data = []
+# ---------------------------------------------------------------------------
+# 1. Open map and click 24 Hour
+# ---------------------------------------------------------------------------
+
+def open_24_hour_map(page):
+    print("Opening DHM Rainfall Watch Map...")
+    page.goto(MAP_URL, wait_until="domcontentloaded", timeout=60000)
+
+    # The page currently exposes the six tabs:
+    # 1 Hour, 3 Hour, 6 Hour, 12 Hour, 24 Hour, Tabular View.
+    if not click_text(page, "24 Hour", timeout=15000):
+        raise RuntimeError("Could not click the '24 Hour' tab.")
+
+    # Give the map layer time to redraw after switching duration.
+    page.wait_for_timeout(2500)
+
+    # Wait until the map itself exists.
     try:
-        rows = page.query_selector_all("table tr")
+        page.locator("#map").wait_for(state="visible", timeout=15000)
     except Exception:
-        rows = []
+        # Some versions may use a different map container.
+        if not page.locator(".leaflet-container").count():
+            raise RuntimeError("DHM map container was not found.")
 
-    for row in rows:
+    save_debug(page, "00_24_hour_map")
+    print("24 Hour map loaded.")
+
+
+# ---------------------------------------------------------------------------
+# 2. Click station markers and collect rainfallSingle links
+# ---------------------------------------------------------------------------
+
+def marker_count(page):
+    selectors = [
+        "#map .leaflet-marker-icon",
+        "#map .leaflet-interactive",
+        ".leaflet-container .leaflet-marker-icon",
+        ".leaflet-container .leaflet-interactive",
+    ]
+    count = 0
+    for selector in selectors:
         try:
-            cells = row.query_selector_all("td, th")
-            texts = [c.inner_text().strip() for c in cells]
+            count = max(count, page.locator(selector).count())
         except Exception:
+            pass
+    return count
+
+
+def extract_station_id_from_html(html):
+    m = re.search(r"/hydrology/rainfallSingle/(\d+)", html)
+    return m.group(1) if m else None
+
+
+def extract_station_name(popup_text, station_id):
+    lines = [x.strip() for x in popup_text.splitlines() if x.strip()]
+
+    # Remove obvious UI labels and return the first useful line.
+    bad = {
+        "VIEW", "View", "DETAIL", "Details", "Station",
+        "Rainfall", "Rainfall Watch Map",
+    }
+
+    for line in lines:
+        if line in bad:
             continue
-
-        if len(texts) < 2:
+        if re.fullmatch(r"[\d.,\-\s]+", line):
             continue
-
-        date_str = None
-        for pattern in DATE_PATTERNS:
-            m = re.search(pattern, texts[0])
-            if m:
-                date_str = parse_date_token(m.group(0))
-                if date_str:
-                    break
-        if not date_str:
+        if "rainfallSingle" in line:
             continue
+        if len(line) > 1:
+            return line[:150]
 
-        daily_val = parse_number(texts[1]) if len(texts) > 1 else None
-        total_val = parse_number(texts[2]) if len(texts) > 2 else None
-
-        if daily_val is not None:
-            rows_data.append((date_str, daily_val, total_val))
-
-    return rows_data
+    return f"Station_{station_id}"
 
 
-def extract_rainfall_history(page, debug_tag=None):
+def discover_stations_from_map(page):
     """
-    Clicks the "Daily" period tab and VIEW, then reads the resulting
-    table (Date | Daily | Total).
+    Click map markers and collect station links from their Leaflet popups.
 
-    Doesn't touch the Date field: it's confirmed to default to today,
-    and rather than fight an unconfirmed date-picker element, today's
-    row (which may still be accumulating) is simply filtered out of
-    the result below instead.
-
-    Returns a list of (date_str, daily_value, total_value) tuples,
-    excluding today's row.
+    This deliberately uses the map first, as requested. We do not assume
+    that station IDs are known beforehand.
     """
-    period_set_ok = set_period_to_daily(page)
+    print("Discovering stations by clicking map markers...")
 
-    for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
-        try:
-            page.click(selector, timeout=3000)
+    # Wait briefly for marker rendering.
+    for _ in range(20):
+        if marker_count(page) > 0:
             break
+        page.wait_for_timeout(500)
+
+    total = marker_count(page)
+    print(f"Found about {total} map marker element(s).")
+
+    stations = {}
+    selectors = [
+        "#map .leaflet-marker-icon",
+        "#map .leaflet-interactive",
+    ]
+
+    # Process both DOM marker types, deduplicating by station URL.
+    candidates = []
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            for i in range(loc.count()):
+                candidates.append((selector, i))
         except Exception:
+            pass
+
+    for n, (selector, i) in enumerate(candidates, start=1):
+        try:
+            marker = page.locator(selector).nth(i)
+            if not marker.is_visible():
+                continue
+
+            marker.scroll_into_view_if_needed(timeout=2000)
+            marker.click(force=True, timeout=3000)
+            page.wait_for_timeout(250)
+
+            popup = page.locator(".leaflet-popup").last
+            if not popup.is_visible():
+                continue
+
+            html = popup.inner_html()
+            station_id = extract_station_id_from_html(html)
+
+            # Sometimes the URL is represented as a normal href; sometimes
+            # it is embedded in popup HTML/JavaScript.
+            if not station_id:
+                station_id = extract_station_id_from_html(popup.inner_text())
+
+            if not station_id:
+                continue
+
+            name = extract_station_name(popup.inner_text(), station_id)
+            url = STATION_URL.format(station_id)
+
+            stations[station_id] = {
+                "url_id": station_id,
+                "name": name,
+                "url": url,
+            }
+
+            print(f"  [{len(stations)}] {name} -> {url}")
+
+        except Exception:
+            # One bad/covered marker should not stop the whole map scan.
             continue
 
+        # Close popup so the next marker is clean.
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    save_debug(page, "01_after_station_discovery")
+
+    result = list(stations.values())
+
+    if MAX_STATIONS:
+        result = result[:MAX_STATIONS]
+
+    print(f"Discovered {len(result)} unique station(s).")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 3. Set Date = yesterday and Period = Daily
+# ---------------------------------------------------------------------------
+
+def find_date_input(page):
+    """Find the Date input without assuming a fixed element ID."""
+    inputs = page.locator("input")
+    candidates = []
+
+    for i in range(inputs.count()):
+        try:
+            el = inputs.nth(i)
+            attrs = el.evaluate(
+                """e => ({
+                    type: e.type || '',
+                    id: e.id || '',
+                    name: e.name || '',
+                    placeholder: e.placeholder || '',
+                    value: e.value || '',
+                    aria: e.getAttribute('aria-label') || ''
+                })"""
+            )
+            blob = " ".join(str(v).lower() for v in attrs.values())
+
+            score = 0
+            if attrs["type"].lower() == "date":
+                score += 100
+            if "date" in blob:
+                score += 30
+            if "from" in blob or "start" in blob:
+                score += 5
+
+            candidates.append((score, i, attrs))
+
+        except Exception:
+            pass
+
+    candidates.sort(reverse=True)
+
+    if candidates and candidates[0][0] > 0:
+        return inputs.nth(candidates[0][1])
+
+    return None
+
+
+def set_date_yesterday(page):
+    target = yesterday_iso()
+    inp = find_date_input(page)
+
+    if inp is None:
+        raise RuntimeError("Could not locate the Date input on the station page.")
+
+    # First try Playwright fill.
     try:
-        page.wait_for_selector("text=Accumulated Rainfall", timeout=8000)
+        inp.fill(target, timeout=3000)
     except Exception:
         pass
+
+    # Then explicitly set the DOM value and fire events. This handles date
+    # pickers/framework-bound inputs that ignore a normal fill.
     try:
-        page.wait_for_load_state("networkidle", timeout=8000)
+        inp.evaluate(
+            """(e, value) => {
+                const setter =
+                  Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                  ).set;
+                setter.call(e, value);
+                e.dispatchEvent(new Event('input', {bubbles: true}));
+                e.dispatchEvent(new Event('change', {bubbles: true}));
+                e.blur();
+            }""",
+            target,
+        )
+    except Exception:
+        pass
+
+    # Verify what the browser actually has.
+    try:
+        actual = inp.input_value()
+    except Exception:
+        actual = ""
+
+    if actual != target:
+        raise RuntimeError(
+            f"Date input did not accept yesterday. Expected {target}, got {actual!r}"
+        )
+
+    return target
+
+
+def set_period_daily(page):
+    selects = page.locator("select")
+
+    for i in range(selects.count()):
+        select = selects.nth(i)
+        try:
+            options = select.locator("option").all_inner_texts()
+            if any(o.strip().lower() == "daily" for o in options):
+                select.select_option(label="Daily")
+                return True
+        except Exception:
+            pass
+
+    # Fallback if the site uses a custom dropdown.
+    for selector in [
+        "label:has-text('Daily')",
+        "text=Daily",
+        "[value='daily']",
+    ]:
+        try:
+            loc = page.locator(selector).first
+            loc.click(timeout=2000)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def click_view(page):
+    for selector in [
+        "button:has-text('VIEW')",
+        "input[value='VIEW']",
+        "a:has-text('VIEW')",
+        "text=VIEW",
+    ]:
+        try:
+            loc = page.locator(selector).first
+            loc.wait_for(state="visible", timeout=3000)
+            loc.click()
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 4. Read the Accumulated Rainfall table
+# ---------------------------------------------------------------------------
+
+def read_rainfall_table(page):
+    """
+    Select the table whose header contains Date + Daily. This is safer than
+    simply reading the first <table>, because the station page can contain
+    other tables/HTML elements.
+    """
+    tables = page.locator("table")
+
+    for i in range(tables.count()):
+        table = tables.nth(i)
+        try:
+            text = table.inner_text()
+            low = text.lower()
+
+            if "date" not in low or "daily" not in low:
+                continue
+
+            rows = table.locator("tr")
+            extracted = []
+
+            for r in range(rows.count()):
+                cells = rows.nth(r).locator("th, td")
+                vals = [x.strip() for x in cells.all_inner_texts()]
+
+                if len(vals) < 2:
+                    continue
+
+                date_str = parse_date(vals[0])
+                if not date_str:
+                    continue
+
+                daily = parse_number(vals[1])
+                total = parse_number(vals[2]) if len(vals) >= 3 else None
+
+                if daily is not None:
+                    extracted.append((date_str, daily, total))
+
+            if extracted:
+                return extracted
+
+        except Exception:
+            continue
+
+    return []
+
+
+def extract_station_history(page, debug_tag):
+    target = set_date_yesterday()
+    daily_ok = set_period_daily()
+
+    if not daily_ok:
+        raise RuntimeError("Could not set Period to Daily.")
+
+    if not click_view(page):
+        raise RuntimeError("Could not click VIEW.")
+
+    # Wait until the table actually appears.
+    try:
+        page.locator("table").filter(
+            has_text="Daily"
+        ).first.wait_for(state="visible", timeout=15000)
     except Exception:
         page.wait_for_timeout(3000)
 
-    all_rows = table_rows_from_page(page)
-    today = nepal_today_iso()
-    kept_rows = [r for r in all_rows if r[0] != today]
-    skipped_today = [r for r in all_rows if r[0] == today]
+    # Give AJAX-rendered table rows time to settle.
+    page.wait_for_timeout(1000)
 
-    if debug_tag:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
-        page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}.png"))
-        with open(os.path.join(DEBUG_DIR, f"{debug_tag}.txt"), "w", encoding="utf-8") as f:
-            f.write(f"period_set_ok (clicked 'Daily' tab): {period_set_ok}\n")
-            f.write(f"today (Nepal): {today}\n")
-            f.write(f"all_rows_extracted: {all_rows}\n")
-            f.write(f"skipped_today_row (still accumulating): {skipped_today}\n")
-            f.write(f"kept_rows (written to Excel): {kept_rows}\n\n")
-            f.write("=== FULL PAGE TEXT AFTER VIEW ===\n")
-            f.write(page.inner_text("body"))
+    rows = read_rainfall_table(page)
 
-    return kept_rows
+    if DEBUG:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        (DEBUG_DIR / f"{debug_tag}.txt").write_text(
+            f"target_date={target}\n"
+            f"period_daily={daily_ok}\n"
+            f"rows={rows}\n\n"
+            f"--- PAGE TEXT ---\n"
+            + page.locator("body").inner_text(),
+            encoding="utf-8",
+        )
+        save_debug(page, debug_tag)
+
+    if not rows:
+        raise RuntimeError("No Daily rainfall table rows were extracted.")
+
+    return rows
 
 
-def get_existing_dates(path):
-    if not os.path.exists(path):
+# ---------------------------------------------------------------------------
+# 5. Excel output
+# ---------------------------------------------------------------------------
+
+def safe_filename(name, station_id):
+    clean = re.sub(r"[^\w\-]+", "_", name).strip("_")
+    return f"{station_id}_{clean or 'station'}.xlsx"
+
+
+def existing_dates(path):
+    if not path.exists():
         return set()
-    wb = load_workbook(path)
+
+    wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
-    dates = set()
+
+    found = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if row and row[0]:
-            dates.add(str(row[0]))
-    return dates
+        if not row or row[0] is None:
+            continue
+
+        value = row[0]
+        if isinstance(value, dt.datetime):
+            found.add(value.strftime("%Y-%m-%d"))
+        elif isinstance(value, dt.date):
+            found.add(value.strftime("%Y-%m-%d"))
+        else:
+            parsed = parse_date(str(value))
+            if parsed:
+                found.add(parsed)
+            else:
+                found.add(str(value))
+
+    wb.close()
+    return found
 
 
-def append_new_rows(path, new_entries, run_timestamp):
-    """new_entries: list of (date_str, daily_value, total_value) tuples
-    NOT already in the file. Appends one row per entry and saves."""
-    if os.path.exists(path):
+def append_rows(path, rows):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
         wb = load_workbook(path)
         ws = wb.active
     else:
         wb = Workbook()
         ws = wb.active
-        ws.append(["Date", "Daily Rainfall (mm)", "Running Total on page (mm)", "First recorded (UTC)"])
+        ws.title = "Daily Rainfall"
+        ws.append([
+            "Date",
+            "Daily Rainfall (mm)",
+            "Running Total on page (mm)",
+        ])
 
-    for date_str, daily_val, total_val in sorted(new_entries):
-        ws.append([date_str, daily_val, total_val, run_timestamp])
+    existing = existing_dates(path)
 
+    added = 0
+    for date_str, daily, total in sorted(rows):
+        if date_str in existing:
+            continue
+
+        ws.append([date_str, daily, total])
+        added += 1
+        existing.add(date_str)
+
+    # Store actual Excel dates for easier sorting/filtering.
+    for cell in ws["A"][1:]:
+        if isinstance(cell.value, str):
+            try:
+                cell.value = dt.datetime.strptime(
+                    cell.value, "%Y-%m-%d"
+                ).date()
+                cell.number_format = "yyyy-mm-dd"
+            except ValueError:
+                pass
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
     wb.save(path)
 
+    return added
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
 
-    with open(STATIONS_FILE, encoding="utf-8") as f:
-        stations = json.load(f)
-
-    if DEBUG_STATIONS:
-        stations = stations[:DEBUG_STATIONS]
-        print(f"DEBUG MODE: running only {len(stations)} station(s)")
-
-    run_timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    run_time = dt.datetime.now(dt.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
     with sync_playwright() as p:
-        # Always headless: this runs on GitHub's servers, which have no
-        # display. Debug mode still works -- it saves a screenshot and
-        # the page text/state to output/debug/ so you can inspect the
-        # result afterward instead of watching a live browser window.
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
 
-        for station in stations:
-            url_id = station["url_id"]
-            name = station["name"]
-            print(f"-> {name} (url_id={url_id})")
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1000},
+            locale="en-US",
+            timezone_id="Asia/Kathmandu",
+        )
 
-            filename = safe_filename(name, station.get("station_index"), url_id)
-            filepath = os.path.join(OUTPUT_DIR, filename)
+        map_page = context.new_page()
 
-            try:
-                page.goto(STATION_URL.format(url_id), timeout=20000)
-                debug_tag = None
-                if DEBUG_STATIONS:
-                    clean_name_for_tag = re.sub(r"[^\w-]+", "_", name)
-                    debug_tag = f"{url_id}_{clean_name_for_tag}"
-                history = extract_rainfall_history(page, debug_tag=debug_tag)
-            except Exception as e:
-                print(f"   failed: {e}")
-                history = []
+        try:
+            open_24_hour_map(map_page)
+            stations = discover_stations_from_map(map_page)
 
-            print(f"   read {len(history)} row(s): {history}")
+            if not stations:
+                raise RuntimeError(
+                    "No station links were discovered by clicking the map. "
+                    "Run with DEBUG=1 HEADLESS=0 to inspect the map."
+                )
 
-            existing_dates = get_existing_dates(filepath)
-            new_entries = [(d, daily, total) for d, daily, total in history if d not in existing_dates]
+            print("\nStarting station extraction...")
+            print(f"Yesterday in Nepal: {yesterday_iso()}")
+            print(f"Run time: {run_time}\n")
 
-            if new_entries:
-                append_new_rows(filepath, new_entries, run_timestamp)
-                print(f"   added {len(new_entries)} new row(s): {sorted(new_entries)}")
-            else:
-                print("   no new rows to add (all already recorded, or nothing parsed)")
+            for number, station in enumerate(stations, start=1):
+                station_id = station["url_id"]
+                name = station["name"]
+                url = station["url"]
 
-            # Google Drive upload is disabled for now -- output/*.xlsx is
-            # available as a downloadable workflow artifact instead. To
-            # re-enable later, restore get_drive_service()/upload_to_drive()
-            # from the previous version and call them here.
+                print(f"[{number}/{len(stations)}] {name} ({station_id})")
 
-            time.sleep(0.5)  # be polite to the server
+                station_page = context.new_page()
 
-        browser.close()
+                try:
+                    station_page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
 
-    print("Done.")
+                    station_page.wait_for_timeout(1000)
+
+                    rows = extract_station_history(
+                        station_page,
+                        f"station_{station_id}",
+                    )
+
+                    path = OUTPUT_DIR / safe_filename(name, station_id)
+                    added = append_rows(path, rows)
+
+                    print(
+                        f"    extracted {len(rows)} row(s); "
+                        f"added {added} new row(s) -> {path}"
+                    )
+
+                except Exception as exc:
+                    print(f"    FAILED: {exc}")
+                    save_debug(station_page, f"ERROR_station_{station_id}")
+
+                finally:
+                    station_page.close()
+
+                # Small delay so the site is not hammered.
+                time.sleep(0.75)
+
+        finally:
+            map_page.close()
+            browser.close()
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
