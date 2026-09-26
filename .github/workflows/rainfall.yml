@@ -3,6 +3,13 @@ name: DHM Rainfall Scrape
 on:
   workflow_dispatch: {}
 
+  schedule:
+    # 1:00 AM Nepal time = 19:15 UTC previous day
+    - cron: "15 19 * * *"
+
+    # 10:00 AM Nepal time = 04:15 UTC
+    - cron: "15 4 * * *"
+
 jobs:
   rainfall:
     runs-on: ubuntu-latest
@@ -35,6 +42,6 @@ jobs:
 
       - name: Run rainfall scraper
         env:
-          DEBUG_STATIONS: "1"
+          DEBUG_STATIONS: "0"
         run: |
           python main.py
