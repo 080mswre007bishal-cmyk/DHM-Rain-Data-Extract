@@ -112,14 +112,68 @@ def click_24_hour(page):
 
 
 def get_marker_locator(page):
-    for selector in ["#map .leaflet-marker-icon", ".leaflet-container .leaflet-marker-icon"]:
+    """
+    Return the clickable DHM rainfall station layers.
+
+    DHM does not always render rainfall stations as
+    .leaflet-marker-icon elements. On some page versions they
+    are Leaflet SVG interactive layers (circle/path elements).
+    Prefer icon markers when present, otherwise use the SVG
+    interactive layers.
+    """
+    selectors = [
+        "#map .leaflet-marker-icon",
+        ".leaflet-container .leaflet-marker-icon",
+        "#map .leaflet-overlay-pane svg path.leaflet-interactive",
+        ".leaflet-container .leaflet-overlay-pane svg path.leaflet-interactive",
+        "#map .leaflet-overlay-pane svg circle.leaflet-interactive",
+        ".leaflet-container .leaflet-overlay-pane svg circle.leaflet-interactive",
+    ]
+
+    for selector in selectors:
         loc = page.locator(selector)
         try:
-            if loc.count() > 0:
-                return loc
+            count = loc.count()
+            if count > 0:
+                # For SVG layers, discard very large paths (basemap/boundaries)
+                # and keep small clickable station shapes.
+                if "leaflet-overlay-pane" in selector:
+                    usable = []
+                    for i in range(count):
+                        el = loc.nth(i)
+                        try:
+                            if not el.is_visible():
+                                continue
+                            box = el.bounding_box()
+                            if not box:
+                                continue
+                            # Station circles are small. A generous limit keeps
+                            # large river/basin boundary paths out.
+                            if box["width"] <= 45 and box["height"] <= 45:
+                                usable.append(i)
+                        except Exception:
+                            pass
+                    if usable:
+                        # Return a locator matching the exact usable nodes.
+                        return loc.filter(has=None) if False else _indexed_locator(loc, usable)
+                else:
+                    return loc
         except Exception:
             pass
     return None
+
+
+def _indexed_locator(base, indexes):
+    """Create a locator containing only the supplied zero-based indexes."""
+    # CSS :is() cannot reliably address nth DOM siblings, so use a
+    # locator over the base and expose a small wrapper through a JS-backed
+    # selector is unnecessarily fragile. Instead, use a Locator union.
+    if not indexes:
+        return None
+    result = base.nth(indexes[0])
+    for idx in indexes[1:]:
+        result = result.or_(base.nth(idx))
+    return result
 
 
 def _candidate_panels(root):
@@ -508,7 +562,20 @@ def main():
                     break
                 page.wait_for_timeout(500)
             if not marker_locator:
-                raise RuntimeError("No Leaflet station markers were found.")
+                # Save enough information to diagnose a DHM DOM change.
+                save_debug(page, "NO_MARKERS")
+                try:
+                    counts = {
+                        "marker_icons": page.locator(".leaflet-container .leaflet-marker-icon").count(),
+                        "interactive_paths": page.locator(".leaflet-container .leaflet-overlay-pane svg path.leaflet-interactive").count(),
+                        "interactive_circles": page.locator(".leaflet-container .leaflet-overlay-pane svg circle.leaflet-interactive").count(),
+                        "leaflet_paths": page.locator(".leaflet-container .leaflet-overlay-pane svg path").count(),
+                        "leaflet_circles": page.locator(".leaflet-container .leaflet-overlay-pane svg circle").count(),
+                    }
+                    print(f"Leaflet DOM diagnostic: {counts}")
+                except Exception:
+                    pass
+                raise RuntimeError("No clickable Leaflet rainfall station layers were found. See output/debug/NO_MARKERS.*")
             total = marker_locator.count()
             if DEBUG:
                 total_to_process = min(total, DEBUG_MAX_STATIONS)
