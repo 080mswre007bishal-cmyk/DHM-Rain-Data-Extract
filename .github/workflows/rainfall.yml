@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  google-write-test:
+  rainfall:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,9 +16,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Google dependencies
+      - name: Install Python dependencies
         run: |
-          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install --with-deps chromium
 
       - name: Restore Google credentials
         shell: bash
@@ -29,6 +33,8 @@ jobs:
           printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
           printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
 
-      - name: Test Google Sheet write
+      - name: Run rainfall scraper
+        env:
+          DEBUG_STATIONS: "1"
         run: |
-          python google_write_test.py
+          python main.py

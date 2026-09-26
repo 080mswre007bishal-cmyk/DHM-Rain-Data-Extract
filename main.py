@@ -3,22 +3,41 @@ main.py
 -------
 
 For every station in stations.json:
+
   1. Go to the DHM rainfall-watch-map page.
-  2. In the "SORT & FILTERS" panel, set Filter type to "Station No."
-     and pick this station's own Station Index in the Station Number
-     dropdown, then click "Apply Filter" -- this targets the exact
-     right station instead of guessing among ~700+ map markers.
-  3. Click the marker that appears/gets highlighted.
-  4. In the popup panel that opens, select "Daily" in the Period
-     dropdown, click VIEW, and read the resulting Date | Daily | Total
-     table.
-  5. Skip today's row and write the rest to output/<station>.xlsx.
+  2. In the "SORT & FILTERS" panel, set Filter type to
+     "Station No." and select this station's Station Index.
+  3. Click "Apply Filter".
+  4. Click the station marker.
+  5. In the station popup/panel, select "Daily".
+  6. Click "VIEW".
+  7. Read the Date | Daily Rainfall table.
+  8. Skip today's row.
+  9. Save the data locally as output/<station>.xlsx.
+ 10. Create/find a separate Google Spreadsheet for this station.
+ 11. Add only dates that are not already present in that
+     station's Google Spreadsheet.
 
-Dedup is currently OFF while debugging -- every row gets written every run.
+Google Drive structure:
 
-This version works in:
-  - Windows CMD / local computer: headed browser
-  - GitHub Actions: headless browser
+    DHM Rainfall/
+        1001_Dipayal
+        1002_Tarakhola
+        1003_Panchase
+        ...
+
+Each station has its own Google Spreadsheet.
+
+Each station spreadsheet contains:
+
+    Date | Daily Rainfall (mm)
+
+Duplicate checking is performed by DATE because each
+Google Spreadsheet belongs to only one station.
+
+Browser mode:
+    Local Windows  -> headed
+    GitHub Actions -> headless
 """
 
 import datetime
@@ -28,7 +47,12 @@ import re
 import time
 
 from openpyxl import Workbook, load_workbook
+
 from playwright.sync_api import sync_playwright
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 
 
 # ============================================================
@@ -36,20 +60,55 @@ from playwright.sync_api import sync_playwright
 # ============================================================
 
 STATIONS_FILE = "stations.json"
+
 OUTPUT_DIR = "output"
-DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
-
-MAP_URL = "https://dhm.gov.np/hydrology/rainfall-watch-map"
-
-# Set DEBUG_STATIONS=1 to process only first station.
-#
-# Example:
-#   DEBUG_STATIONS=1 python main.py
-#
-# Set DEBUG_STATIONS=5 to process first 5 stations.
-DEBUG_STATIONS = int(
-    os.environ.get("DEBUG_STATIONS", "0")
+DEBUG_DIR = os.path.join(
+    OUTPUT_DIR,
+    "debug"
 )
+
+MAP_URL = (
+    "https://dhm.gov.np/"
+    "hydrology/rainfall-watch-map"
+)
+
+# Google Drive folder containing all station spreadsheets.
+GOOGLE_FOLDER_NAME = "DHM Rainfall"
+
+# Name of the worksheet/tab inside every station spreadsheet.
+GOOGLE_SHEET_TAB = "Rainfall"
+
+# Google OAuth scopes.
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+
+# ------------------------------------------------------------
+# Debug mode
+# ------------------------------------------------------------
+
+# DEBUG_STATIONS=1
+#     -> process only first station
+#
+# DEBUG_STATIONS=5
+#     -> process first five stations
+#
+# DEBUG_STATIONS=0
+#     -> process all stations
+
+DEBUG_STATIONS = int(
+    os.environ.get(
+        "DEBUG_STATIONS",
+        "0"
+    )
+)
+
+
+# ------------------------------------------------------------
+# Nepal time
+# ------------------------------------------------------------
 
 NEPAL_OFFSET = datetime.timedelta(
     hours=5,
@@ -73,6 +132,7 @@ DATE_FORMATS = [
     "%d-%m-%Y",
 ]
 
+
 DATE_PATTERNS = [
     r"[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}(?:,\s+\d{1,2}:\d{2}\s*[AP]M)?",
     r"\d{4}-\d{2}-\d{2}",
@@ -86,9 +146,16 @@ DATE_PATTERNS = [
 # FILE / NAME HELPERS
 # ============================================================
 
-def safe_filename(name, station_index, url_id):
+def safe_filename(
+    name,
+    station_index,
+    url_id
+):
 
-    base = station_index or url_id
+    base = (
+        station_index
+        or url_id
+    )
 
     clean_name = re.sub(
         r"[^\w\-]+",
@@ -96,7 +163,41 @@ def safe_filename(name, station_index, url_id):
         name
     ).strip("_")
 
-    return f"{base}_{clean_name}.xlsx"
+    return (
+        f"{base}_{clean_name}.xlsx"
+    )
+
+
+def safe_google_name(
+    name,
+    station_index,
+    url_id
+):
+    """
+    Creates the name of the individual Google Spreadsheet.
+
+    Example:
+        1001_Dipayal
+    """
+
+    base = (
+        str(station_index).strip()
+        if station_index
+        else str(url_id).strip()
+    )
+
+    clean_name = re.sub(
+        r"[^\w\-]+",
+        "_",
+        str(name)
+    ).strip("_")
+
+    if clean_name:
+        return (
+            f"{base}_{clean_name}"
+        )
+
+    return base
 
 
 def nepal_today_iso():
@@ -126,7 +227,9 @@ def parse_date_token(token):
             return datetime.datetime.strptime(
                 token,
                 fmt
-            ).strftime("%Y-%m-%d")
+            ).strftime(
+                "%Y-%m-%d"
+            )
 
         except ValueError:
 
@@ -143,11 +246,18 @@ def parse_number(text):
     )
 
     if not matches:
+
         return None
 
-    val = float(matches[0])
+    val = float(
+        matches[0]
+    )
 
-    return val if 0 <= val < 1000 else None
+    return (
+        val
+        if 0 <= val < 1000
+        else None
+    )
 
 
 # ============================================================
@@ -263,14 +373,12 @@ def open_station_via_filter(
     station_number_ok = False
     apply_ok = False
 
-    # Always compare station numbers as strings.
-
     station_index = str(
         station_index
     ).strip()
 
     # --------------------------------------------------------
-    # STEP 1: Select "Station No." from Filter Type
+    # STEP 1: Select "Station No."
     # --------------------------------------------------------
 
     try:
@@ -310,7 +418,8 @@ def open_station_via_filter(
                 )
 
                 print(
-                    f"   selecting Filter Type: {match}"
+                    f"   selecting Filter Type: "
+                    f"{match}"
                 )
 
                 sel.select_option(
@@ -325,7 +434,8 @@ def open_station_via_filter(
     except Exception as e:
 
         print(
-            f"   Filter Type selection error: {e}"
+            f"   Filter Type selection error: "
+            f"{e}"
         )
 
     if not filter_type_ok:
@@ -338,18 +448,13 @@ def open_station_via_filter(
         return False
 
     # --------------------------------------------------------
-    # STEP 2: WAIT FOR SECOND STATION NO. DROPDOWN
+    # STEP 2: WAIT FOR STATION NUMBER DROPDOWN
     # --------------------------------------------------------
 
     print(
         f"   waiting for Station No. dropdown "
         f"containing {station_index}..."
     )
-
-    # The second dropdown is dynamically created/populated
-    # after selecting "Station No.".
-    #
-    # Try repeatedly for up to 10 seconds.
 
     for attempt in range(20):
 
@@ -382,14 +487,12 @@ def open_station_via_filter(
 
                     continue
 
-                # Look specifically for a dropdown containing
-                # the actual station number.
-
                 if station_index in opts:
 
                     print(
-                        f"   found Station No. dropdown "
-                        f"containing {station_index}"
+                        f"   found Station No. "
+                        f"dropdown containing "
+                        f"{station_index}"
                     )
 
                     sel.select_option(
@@ -407,6 +510,7 @@ def open_station_via_filter(
                     break
 
             if station_number_ok:
+
                 break
 
         except Exception as e:
@@ -414,19 +518,16 @@ def open_station_via_filter(
             if attempt == 19:
 
                 print(
-                    f"   Station No. selection error: "
-                    f"{e}"
+                    f"   Station No. selection "
+                    f"error: {e}"
                 )
-
-    # --------------------------------------------------------
-    # Station number not found
-    # --------------------------------------------------------
 
     if not station_number_ok:
 
         print(
-            f"   Station number {station_index} "
-            f"was not found in the dropdown."
+            f"   Station number "
+            f"{station_index} was not found "
+            f"in the dropdown."
         )
 
         if debug_tag:
@@ -514,10 +615,6 @@ def open_station_via_filter(
 
             pass
 
-    # --------------------------------------------------------
-    # FINAL RESULT
-    # --------------------------------------------------------
-
     return (
         filter_type_ok
         and station_number_ok
@@ -589,6 +686,7 @@ def _candidate_panels(page):
                 try:
 
                     if not el.is_visible():
+
                         continue
 
                     inside_map = el.evaluate(
@@ -596,6 +694,7 @@ def _candidate_panels(page):
                     )
 
                     if inside_map:
+
                         continue
 
                     txt = el.inner_text(
@@ -653,8 +752,7 @@ def set_period_to_daily_in_panel(
 ):
 
     """
-    Real <select>-based Period control,
-    scoped to just this panel.
+    Select Daily in the Period dropdown.
     """
 
     selects = panel.locator(
@@ -734,6 +832,17 @@ def table_rows_from_panel(
     panel
 ):
 
+    """
+    Returns:
+
+        [
+            (date_str, daily_rainfall),
+            ...
+        ]
+
+    Running Total is intentionally ignored.
+    """
+
     rows_data = []
 
     try:
@@ -804,20 +913,8 @@ def table_rows_from_panel(
         # Daily rainfall
         # ----------------------------------------------------
 
-        daily_val = (
-            parse_number(texts[1])
-            if len(texts) > 1
-            else None
-        )
-
-        # ----------------------------------------------------
-        # Running total
-        # ----------------------------------------------------
-
-        total_val = (
-            parse_number(texts[2])
-            if len(texts) > 2
-            else None
+        daily_val = parse_number(
+            texts[1]
         )
 
         if daily_val is not None:
@@ -826,7 +923,6 @@ def table_rows_from_panel(
                 (
                     date_str,
                     daily_val,
-                    total_val,
                 )
             )
 
@@ -837,9 +933,7 @@ def table_rows_from_panel(
 # CLOSE PANEL
 # ============================================================
 
-def close_any_panel(
-    page
-):
+def close_any_panel(page):
 
     for selector in [
         "[aria-label='Close']:visible",
@@ -872,8 +966,6 @@ def close_any_panel(
 
             pass
 
-    # Fallback
-
     try:
 
         page.keyboard.press(
@@ -900,11 +992,14 @@ def process_station(
 ):
 
     """
-    Returns list of:
-        (date_str, daily_value, total_value)
+    Returns:
+
+        [
+            (date_str, daily_rainfall),
+            ...
+        ]
 
     Today's row is excluded.
-    Raises on failure.
     """
 
     station_index = station.get(
@@ -914,8 +1009,8 @@ def process_station(
     if not station_index:
 
         raise RuntimeError(
-            "This station has no station_index in "
-            "stations.json -- can't filter by it."
+            "This station has no station_index "
+            "in stations.json."
         )
 
     # --------------------------------------------------------
@@ -947,8 +1042,9 @@ def process_station(
     if not filtered_ok:
 
         raise RuntimeError(
-            f"Could not apply the Station No. filter "
-            f"for index {station_index!r}."
+            f"Could not apply the Station No. "
+            f"filter for index "
+            f"{station_index!r}."
         )
 
     # --------------------------------------------------------
@@ -966,9 +1062,6 @@ def process_station(
         if panel is not None:
 
             break
-
-        # Popup may need an explicit marker click
-        # after filtering.
 
         markers = get_marker_locator(
             page
@@ -1027,7 +1120,7 @@ def process_station(
         )
 
     # --------------------------------------------------------
-    # Save panel debug files
+    # Save debug files
     # --------------------------------------------------------
 
     if debug_tag:
@@ -1043,7 +1136,7 @@ def process_station(
             panel.screenshot(
                 path=os.path.join(
                     DEBUG_DIR,
-                    f"{safe_debug_tag}_panel.png",
+                    f"{safe_debug_tag}_panel.png"
                 )
             )
 
@@ -1085,19 +1178,9 @@ def process_station(
         )
     )
 
-    # Wait for table
-
-    try:
-
-        page.wait_for_timeout(
-            2000
-        )
-
-    except Exception:
-
-        time.sleep(
-            2
-        )
+    page.wait_for_timeout(
+        2000
+    )
 
     # --------------------------------------------------------
     # Read table
@@ -1131,8 +1214,8 @@ def process_station(
             debug_tag,
             "_result.txt",
             f"filtered_ok: {filtered_ok}\n"
-            f"period_ok (selected Daily): {period_ok}\n"
-            f"view_ok (clicked VIEW): {view_ok}\n"
+            f"period_ok: {period_ok}\n"
+            f"view_ok: {view_ok}\n"
             f"all_rows: {all_rows}\n"
             f"kept_rows: {kept_rows}\n",
         )
@@ -1149,19 +1232,27 @@ def process_station(
 
 
 # ============================================================
-# EXCEL OUTPUT
+# LOCAL EXCEL OUTPUT
 # ============================================================
 
 def append_all_rows(
     path,
-    entries,
-    run_timestamp
+    entries
 ):
 
     """
-    Dedup disabled while debugging.
-    Every row is written every run.
+    Local Excel output.
+
+    Columns:
+
+        Date
+        Daily Rainfall (mm)
+
+    Existing dates are checked so that local Excel files
+    also do not accumulate duplicate rows.
     """
+
+    existing_dates = set()
 
     if os.path.exists(path):
 
@@ -1171,39 +1262,624 @@ def append_all_rows(
 
         ws = wb.active
 
+        # Read existing dates.
+        for row in ws.iter_rows(
+            min_row=2,
+            values_only=True
+        ):
+
+            if not row:
+
+                continue
+
+            value = row[0]
+
+            if value is None:
+
+                continue
+
+            if isinstance(
+                value,
+                datetime.datetime
+            ):
+
+                date_str = (
+                    value.date()
+                    .strftime("%Y-%m-%d")
+                )
+
+            elif isinstance(
+                value,
+                datetime.date
+            ):
+
+                date_str = (
+                    value.strftime(
+                        "%Y-%m-%d"
+                    )
+                )
+
+            else:
+
+                date_str = str(
+                    value
+                ).strip()
+
+            existing_dates.add(
+                date_str
+            )
+
     else:
 
         wb = Workbook()
 
         ws = wb.active
 
+        ws.title = "Rainfall"
+
         ws.append(
             [
                 "Date",
                 "Daily Rainfall (mm)",
-                "Running Total on page (mm)",
-                "First recorded (UTC)",
             ]
         )
 
+    added = 0
+
     for (
         date_str,
-        daily_val,
-        total_val
+        daily_val
     ) in sorted(entries):
+
+        if date_str in existing_dates:
+
+            continue
 
         ws.append(
             [
                 date_str,
                 daily_val,
-                total_val,
-                run_timestamp,
             ]
         )
+
+        existing_dates.add(
+            date_str
+        )
+
+        added += 1
 
     wb.save(
         path
     )
+
+    return added
+
+
+# ============================================================
+# GOOGLE AUTHENTICATION
+# ============================================================
+
+def load_google_credentials():
+
+    """
+    Load OAuth credentials from token.json.
+
+    GitHub Actions creates token.json from the
+    GOOGLE_TOKEN_JSON repository secret.
+    """
+
+    token_path = "token.json"
+
+    if not os.path.exists(
+        token_path
+    ):
+
+        raise FileNotFoundError(
+            "token.json was not found. "
+            "Make sure the GitHub workflow restores "
+            "GOOGLE_TOKEN_JSON before running main.py."
+        )
+
+    creds = (
+        Credentials.from_authorized_user_file(
+            token_path,
+            GOOGLE_SCOPES
+        )
+    )
+
+    if creds.expired:
+
+        if creds.refresh_token:
+
+            print(
+                "Google access token expired. "
+                "Refreshing..."
+            )
+
+            creds.refresh(
+                Request()
+            )
+
+        else:
+
+            raise RuntimeError(
+                "Google credentials have expired "
+                "and no refresh token is available."
+            )
+
+    print(
+        "Google credentials loaded."
+    )
+
+    return creds
+
+
+# ============================================================
+# GOOGLE DRIVE
+# ============================================================
+
+def get_google_drive_folder(
+    drive,
+    folder_name
+):
+
+    """
+    Find the existing DHM Rainfall folder.
+
+    The folder must already exist in Google Drive.
+    """
+
+    print(
+        f"Searching for Google Drive folder: "
+        f"{folder_name}"
+    )
+
+    query = (
+        f"name = '{folder_name}' "
+        f"and mimeType = "
+        f"'application/vnd.google-apps.folder' "
+        f"and trashed = false"
+    )
+
+    results = drive.files().list(
+        q=query,
+        pageSize=100,
+        fields="files(id,name)"
+    ).execute()
+
+    files = results.get(
+        "files",
+        []
+    )
+
+    if not files:
+
+        raise RuntimeError(
+            f"Could not find Google Drive folder: "
+            f"{folder_name}"
+        )
+
+    folder = files[0]
+
+    print(
+        f"Google Drive folder found: "
+        f"{folder['name']}"
+    )
+
+    print(
+        f"Folder ID: {folder['id']}"
+    )
+
+    return folder["id"]
+
+
+# ============================================================
+# GOOGLE SPREADSHEET FIND
+# ============================================================
+
+def find_station_spreadsheet(
+    drive,
+    folder_id,
+    spreadsheet_name
+):
+
+    """
+    Find a station spreadsheet specifically inside
+    the DHM Rainfall folder.
+    """
+
+    escaped_name = (
+        spreadsheet_name.replace(
+            "'",
+            "\\'"
+        )
+    )
+
+    query = (
+        f"name = '{escaped_name}' "
+        f"and mimeType = "
+        f"'application/vnd.google-apps.spreadsheet' "
+        f"and '{folder_id}' in parents "
+        f"and trashed = false"
+    )
+
+    results = drive.files().list(
+        q=query,
+        pageSize=10,
+        fields="files(id,name)"
+    ).execute()
+
+    files = results.get(
+        "files",
+        []
+    )
+
+    if files:
+
+        return files[0]["id"]
+
+    return None
+
+
+# ============================================================
+# GOOGLE SPREADSHEET CREATE
+# ============================================================
+
+def create_station_spreadsheet(
+    drive,
+    sheets,
+    folder_id,
+    spreadsheet_name
+):
+
+    """
+    Create a new Google Spreadsheet for one station
+    and place it inside DHM Rainfall.
+    """
+
+    print(
+        f"   Creating Google Spreadsheet: "
+        f"{spreadsheet_name}"
+    )
+
+    body = {
+        "properties": {
+            "title": spreadsheet_name
+        },
+        "sheets": [
+            {
+                "properties": {
+                    "title": GOOGLE_SHEET_TAB
+                }
+            }
+        ]
+    }
+
+    created = (
+        sheets.spreadsheets()
+        .create(
+            body=body
+        )
+        .execute()
+    )
+
+    spreadsheet_id = created[
+        "spreadsheetId"
+    ]
+
+    # Move spreadsheet into DHM Rainfall folder.
+    drive.files().update(
+        fileId=spreadsheet_id,
+        addParents=folder_id,
+        fields="id,parents"
+    ).execute()
+
+    # Add header row.
+    sheets.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{GOOGLE_SHEET_TAB}!A1:B1",
+        valueInputOption="USER_ENTERED",
+        body={
+            "values": [
+                [
+                    "Date",
+                    "Daily Rainfall (mm)"
+                ]
+            ]
+        }
+    ).execute()
+
+    print(
+        f"   Google Spreadsheet created."
+    )
+
+    print(
+        f"   Spreadsheet ID: "
+        f"{spreadsheet_id}"
+    )
+
+    return spreadsheet_id
+
+
+# ============================================================
+# GOOGLE SPREADSHEET GET OR CREATE
+# ============================================================
+
+def get_or_create_station_spreadsheet(
+    drive,
+    sheets,
+    folder_id,
+    station
+):
+
+    station_index = str(
+        station.get(
+            "station_index",
+            ""
+        )
+    ).strip()
+
+    name = str(
+        station.get(
+            "name",
+            ""
+        )
+    ).strip()
+
+    url_id = str(
+        station.get(
+            "url_id",
+            ""
+        )
+    ).strip()
+
+    spreadsheet_name = safe_google_name(
+        name,
+        station_index,
+        url_id
+    )
+
+    spreadsheet_id = (
+        find_station_spreadsheet(
+            drive,
+            folder_id,
+            spreadsheet_name
+        )
+    )
+
+    if spreadsheet_id:
+
+        print(
+            f"   Google Spreadsheet found: "
+            f"{spreadsheet_name}"
+        )
+
+        return (
+            spreadsheet_id,
+            spreadsheet_name
+        )
+
+    spreadsheet_id = (
+        create_station_spreadsheet(
+            drive,
+            sheets,
+            folder_id,
+            spreadsheet_name
+        )
+    )
+
+    return (
+        spreadsheet_id,
+        spreadsheet_name
+    )
+
+
+# ============================================================
+# GOOGLE SHEET READ EXISTING DATES
+# ============================================================
+
+def get_existing_google_dates(
+    sheets,
+    spreadsheet_id
+):
+
+    """
+    Read column A from the station spreadsheet.
+
+    Returns a set such as:
+
+        {
+            "2026-09-24",
+            "2026-09-25"
+        }
+    """
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{GOOGLE_SHEET_TAB}!A:A"
+        )
+        .execute()
+    )
+
+    values = result.get(
+        "values",
+        []
+    )
+
+    existing_dates = set()
+
+    for row in values:
+
+        if not row:
+
+            continue
+
+        value = str(
+            row[0]
+        ).strip()
+
+        if not value:
+
+            continue
+
+        # Skip header.
+        if value.lower() == "date":
+
+            continue
+
+        # Normalize possible date formats.
+        parsed = parse_date_token(
+            value
+        )
+
+        if parsed:
+
+            existing_dates.add(
+                parsed
+            )
+
+        else:
+
+            # Keep original if already ISO.
+            existing_dates.add(
+                value
+            )
+
+    return existing_dates
+
+
+# ============================================================
+# GOOGLE SHEET APPEND NEW ROWS
+# ============================================================
+
+def append_new_google_rows(
+    sheets,
+    spreadsheet_id,
+    entries
+):
+
+    """
+    Add only dates that are not already in the station
+    spreadsheet.
+
+    Returns:
+
+        number of newly added rows
+    """
+
+    if not entries:
+
+        return 0
+
+    existing_dates = (
+        get_existing_google_dates(
+            sheets,
+            spreadsheet_id
+        )
+    )
+
+    new_rows = []
+
+    for (
+        date_str,
+        daily_val
+    ) in sorted(entries):
+
+        if date_str in existing_dates:
+
+            continue
+
+        new_rows.append(
+            [
+                date_str,
+                daily_val,
+            ]
+        )
+
+    if not new_rows:
+
+        return 0
+
+    (
+        sheets.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{GOOGLE_SHEET_TAB}!A:B",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={
+                "values": new_rows
+            }
+        )
+        .execute()
+    )
+
+    return len(
+        new_rows
+    )
+
+
+# ============================================================
+# GOOGLE PROCESS ONE STATION
+# ============================================================
+
+def save_station_to_google(
+    drive,
+    sheets,
+    folder_id,
+    station,
+    history
+):
+
+    """
+    Create/find the station's individual Google Spreadsheet
+    and add only new dates.
+    """
+
+    (
+        spreadsheet_id,
+        spreadsheet_name
+    ) = get_or_create_station_spreadsheet(
+        drive,
+        sheets,
+        folder_id,
+        station
+    )
+
+    if not history:
+
+        print(
+            "   Google: no scraped rows to upload."
+        )
+
+        return 0
+
+    added = append_new_google_rows(
+        sheets,
+        spreadsheet_id,
+        history
+    )
+
+    if added:
+
+        print(
+            f"   Google: added "
+            f"{added} new row(s) to "
+            f"{spreadsheet_name}"
+        )
+
+    else:
+
+        print(
+            "   Google: no new dates. "
+            "Everything was already present."
+        )
+
+    return added
 
 
 # ============================================================
@@ -1212,14 +1888,18 @@ def append_all_rows(
 
 def main():
 
+    # --------------------------------------------------------
+    # Create local directories
+    # --------------------------------------------------------
+
     os.makedirs(
         OUTPUT_DIR,
-        exist_ok=True,
+        exist_ok=True
     )
 
     os.makedirs(
         DEBUG_DIR,
-        exist_ok=True,
+        exist_ok=True
     )
 
     # --------------------------------------------------------
@@ -1234,10 +1914,6 @@ def main():
         stations = json.load(
             f
         )
-
-    # --------------------------------------------------------
-    # Debug mode
-    # --------------------------------------------------------
 
     if DEBUG_STATIONS:
 
@@ -1259,6 +1935,48 @@ def main():
         )
 
     # --------------------------------------------------------
+    # Google connection
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "======================================"
+    )
+    print(
+        "Connecting to Google Drive / Sheets"
+    )
+    print(
+        "======================================"
+    )
+
+    google_creds = (
+        load_google_credentials()
+    )
+
+    drive = build(
+        "drive",
+        "v3",
+        credentials=google_creds
+    )
+
+    sheets = build(
+        "sheets",
+        "v4",
+        credentials=google_creds
+    )
+
+    google_folder_id = (
+        get_google_drive_folder(
+            drive,
+            GOOGLE_FOLDER_NAME
+        )
+    )
+
+    print(
+        "Google connection ready."
+    )
+
+    # --------------------------------------------------------
     # Run timestamp
     # --------------------------------------------------------
 
@@ -1274,24 +1992,6 @@ def main():
     # --------------------------------------------------------
 
     with sync_playwright() as p:
-
-        # GitHub Actions automatically sets this environment
-        # variable to "true".
-        #
-        # Local Windows:
-        #     GITHUB_ACTIONS is normally not set
-        #     -> headed browser
-        #
-        # GitHub Actions:
-        #     GITHUB_ACTIONS=true
-        #     -> headless browser
-        #
-        # This fixes:
-        #
-        # TargetClosedError:
-        # BrowserType.launch:
-        # Looks like you launched a headed browser
-        # without having a XServer running.
 
         is_github_actions = (
             os.environ.get(
@@ -1326,6 +2026,8 @@ def main():
         # Process stations
         # ----------------------------------------------------
 
+        total_google_added = 0
+
         for station in stations:
 
             url_id = station[
@@ -1336,17 +2038,32 @@ def main():
                 "name"
             ]
 
-            print(
-                f"-> {name} "
-                f"(station_index="
-                f"{station.get('station_index')})"
+            station_index = station.get(
+                "station_index"
             )
+
+            print()
+            print(
+                "======================================"
+            )
+            print(
+                f"Station: {name}"
+            )
+            print(
+                f"Station Index: "
+                f"{station_index}"
+            )
+            print(
+                "======================================"
+            )
+
+            # ------------------------------------------------
+            # Local filename
+            # ------------------------------------------------
 
             filename = safe_filename(
                 name,
-                station.get(
-                    "station_index"
-                ),
+                station_index,
                 url_id,
             )
 
@@ -1375,7 +2092,7 @@ def main():
                 )
 
             # ------------------------------------------------
-            # Process station
+            # Scrape station
             # ------------------------------------------------
 
             try:
@@ -1389,13 +2106,13 @@ def main():
             except Exception as e:
 
                 print(
-                    f"   failed: {e}"
+                    f"   FAILED: {e}"
                 )
 
                 history = []
 
             # ------------------------------------------------
-            # Print result
+            # Print scraped data
             # ------------------------------------------------
 
             print(
@@ -1405,28 +2122,65 @@ def main():
             )
 
             # ------------------------------------------------
-            # Write Excel
+            # Local Excel
             # ------------------------------------------------
 
             if history:
 
-                append_all_rows(
-                    filepath,
-                    history,
-                    run_timestamp,
-                )
+                try:
 
-                print(
-                    f"   wrote "
-                    f"{len(history)} row(s) "
-                    f"(dedup disabled)"
-                )
+                    local_added = (
+                        append_all_rows(
+                            filepath,
+                            history
+                        )
+                    )
+
+                    print(
+                        f"   Local Excel: "
+                        f"added {local_added} "
+                        f"new row(s)"
+                    )
+
+                except Exception as e:
+
+                    print(
+                        f"   Local Excel FAILED: "
+                        f"{e}"
+                    )
 
             else:
 
                 print(
-                    "   nothing parsed, "
-                    "nothing written"
+                    "   Local Excel: "
+                    "nothing to write"
+                )
+
+            # ------------------------------------------------
+            # Google Sheets
+            # ------------------------------------------------
+
+            try:
+
+                google_added = (
+                    save_station_to_google(
+                        drive,
+                        sheets,
+                        google_folder_id,
+                        station,
+                        history
+                    )
+                )
+
+                total_google_added += (
+                    google_added
+                )
+
+            except Exception as e:
+
+                print(
+                    f"   Google upload FAILED: "
+                    f"{e}"
                 )
 
             time.sleep(
@@ -1438,6 +2192,31 @@ def main():
         # ----------------------------------------------------
 
         browser.close()
+
+    # --------------------------------------------------------
+    # Final summary
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "======================================"
+    )
+    print(
+        "RUN COMPLETED"
+    )
+    print(
+        "======================================"
+    )
+
+    print(
+        f"Google rows added this run: "
+        f"{total_google_added}"
+    )
+
+    print(
+        f"Output folder: "
+        f"{OUTPUT_DIR}"
+    )
 
     print(
         "Done."
@@ -1451,4 +2230,3 @@ def main():
 if __name__ == "__main__":
 
     main()
-
