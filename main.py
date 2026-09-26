@@ -186,8 +186,8 @@ def open_24_hour_map(page):
 def marker_count(page):
     selectors = [
         "#map .leaflet-marker-icon",
-        "#map .leaflet-interactive",
         ".leaflet-container .leaflet-marker-icon",
+        "#map .leaflet-interactive",
         ".leaflet-container .leaflet-interactive",
     ]
     count = 0
@@ -199,18 +199,37 @@ def marker_count(page):
     return count
 
 
-def extract_station_id_from_html(html):
-    m = re.search(r"/hydrology/rainfallSingle/(\d+)", html)
+def station_id_from_url(url):
+    if not url:
+        return None
+    m = re.search(r"/hydrology/rainfallSingle/(\d+)", url)
     return m.group(1) if m else None
+
+
+def extract_station_id_from_text(text):
+    """Find a rainfallSingle ID or common station-id attribute in HTML/JS."""
+    if not text:
+        return None
+
+    patterns = [
+        r"/hydrology/rainfallSingle/(\d+)",
+        r"rainfallSingle[\"'\s:/]+(\d+)",
+        r"(?:station[_ -]?id|stationId|stationID|station_number|stationNumber)\s*[=:]\s*[\"']?(\d+)",
+        r"(?:station[_ -]?index|stationIndex)\s*[=:]\s*[\"']?(\d+)",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return m.group(1)
+    return None
 
 
 def extract_station_name(popup_text, station_id):
     lines = [x.strip() for x in popup_text.splitlines() if x.strip()]
-
-    # Remove obvious UI labels and return the first useful line.
     bad = {
         "VIEW", "View", "DETAIL", "Details", "Station",
-        "Rainfall", "Rainfall Watch Map",
+        "Rainfall", "Rainfall Watch Map", "24 Hour",
     }
 
     for line in lines:
@@ -226,17 +245,124 @@ def extract_station_name(popup_text, station_id):
     return f"Station_{station_id}"
 
 
+def add_station(stations, station_id, name=None):
+    if not station_id:
+        return False
+    station_id = str(station_id)
+    if station_id in stations:
+        return False
+
+    stations[station_id] = {
+        "url_id": station_id,
+        "name": name or f"Station_{station_id}",
+        "url": STATION_URL.format(station_id),
+    }
+    print(f"  [{len(stations)}] {stations[station_id]['name']} -> {stations[station_id]['url']}")
+    return True
+
+
+def collect_station_links_from_dom(page, stations):
+    """Look everywhere in the rendered DOM, not only inside a popup."""
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    # Direct rainfallSingle URLs in HTML/inline JavaScript.
+    for sid in re.findall(r"/hydrology/rainfallSingle/(\d+)", html):
+        add_station(stations, sid)
+
+    # Inspect links, buttons and elements carrying URL/data attributes.
+    try:
+        elements = page.locator("a,button,[onclick],[data-url],[data-href],[data-id],[data-station-id]")
+        for i in range(min(elements.count(), 5000)):
+            el = elements.nth(i)
+            try:
+                attrs = el.evaluate("""e => ({
+                    text: e.innerText || '',
+                    href: e.getAttribute('href') || '',
+                    onclick: e.getAttribute('onclick') || '',
+                    dataUrl: e.getAttribute('data-url') || '',
+                    dataHref: e.getAttribute('data-href') || '',
+                    dataId: e.getAttribute('data-id') || '',
+                    dataStationId: e.getAttribute('data-station-id') || ''
+                })""")
+                blob = " ".join(str(v) for v in attrs.values())
+                sid = extract_station_id_from_text(blob)
+                if sid:
+                    add_station(stations, sid, attrs.get("text", "").strip() or None)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def click_popup_station_control(page, popup, stations):
+    """Some DHM versions put the station navigation in a JS button rather
+    than an <a href>. Click those controls and capture the resulting URL."""
+    controls = popup.locator("a,button,[role='button'],[onclick],[data-url],[data-href]")
+
+    for i in range(controls.count()):
+        control = controls.nth(i)
+        try:
+            attrs = control.evaluate("""e => ({
+                text: e.innerText || '',
+                href: e.getAttribute('href') || '',
+                onclick: e.getAttribute('onclick') || '',
+                dataUrl: e.getAttribute('data-url') || '',
+                dataHref: e.getAttribute('data-href') || ''
+            })""")
+            blob = " ".join(str(v) for v in attrs.values())
+            sid = extract_station_id_from_text(blob)
+            if sid:
+                add_station(stations, sid, attrs.get("text", "").strip() or None)
+                return True
+
+            text = attrs.get("text", "").strip().lower()
+            if not any(x in text for x in ("view", "detail", "station")):
+                continue
+
+            old_url = page.url
+            control.click(force=True, timeout=3000)
+            page.wait_for_timeout(500)
+
+            sid = station_id_from_url(page.url)
+            if sid:
+                add_station(stations, sid)
+                if page.url != old_url:
+                    page.go_back(wait_until="domcontentloaded", timeout=15000)
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 def discover_stations_from_map(page):
     """
-    Click map markers and collect station links from their Leaflet popups.
+    Discover station IDs from the 24-hour map.
 
-    This deliberately uses the map first, as requested. We do not assume
-    that station IDs are known beforehand.
+    Important: the DHM map markers do NOT necessarily contain a normal
+    rainfallSingle href inside the Leaflet popup. Earlier code assumed they
+    did, which is why 729 markers could be found but 0 stations discovered.
+
+    This version uses several layers:
+      1. rendered DOM/inline JS scan for rainfallSingle URLs;
+      2. actual marker click + popup inspection;
+      3. clicking View/Details controls inside the popup;
+      4. a Tabular View fallback if the map popup does not expose IDs.
     """
-    print("Discovering stations by clicking map markers...")
+    print("Discovering stations from the 24 Hour map...")
+    stations = {}
 
-    # Wait briefly for marker rendering.
-    for _ in range(20):
+    # First check whether the page already contains station URLs in its
+    # rendered HTML or JavaScript data.
+    collect_station_links_from_dom(page, stations)
+    if stations:
+        print(f"Found {len(stations)} station URL(s) in the map DOM/data.")
+
+    # Wait for marker rendering.
+    for _ in range(30):
         if marker_count(page) > 0:
             break
         page.wait_for_timeout(500)
@@ -244,72 +370,102 @@ def discover_stations_from_map(page):
     total = marker_count(page)
     print(f"Found about {total} map marker element(s).")
 
-    stations = {}
-    selectors = [
-        "#map .leaflet-marker-icon",
-        "#map .leaflet-interactive",
-    ]
+    # Prefer one marker selector. Using both .leaflet-marker-icon and
+    # .leaflet-interactive previously caused duplicate/overlapping clicks.
+    selector = "#map .leaflet-marker-icon"
+    if page.locator(selector).count() == 0:
+        selector = ".leaflet-container .leaflet-marker-icon"
 
-    # Process both DOM marker types, deduplicating by station URL.
-    candidates = []
-    for selector in selectors:
-        try:
-            loc = page.locator(selector)
-            for i in range(loc.count()):
-                candidates.append((selector, i))
-        except Exception:
-            pass
+    loc = page.locator(selector)
+    count = loc.count()
+    print(f"Scanning {count} marker icon(s)...")
 
-    for n, (selector, i) in enumerate(candidates, start=1):
+    # Do not make a 729-marker scan unnecessarily slow if we already have all
+    # stations from page data. Still allow MAX_STATIONS testing.
+    marker_limit = count
+    if MAX_STATIONS:
+        marker_limit = min(marker_limit, max(MAX_STATIONS * 5, 30))
+
+    for i in range(marker_limit):
         try:
-            marker = page.locator(selector).nth(i)
+            marker = loc.nth(i)
             if not marker.is_visible():
                 continue
 
             marker.scroll_into_view_if_needed(timeout=2000)
             marker.click(force=True, timeout=3000)
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(350)
 
             popup = page.locator(".leaflet-popup").last
             if not popup.is_visible():
+                # Try a DOM click event as a fallback for Leaflet markers whose
+                # native click is intercepted by an overlay.
+                try:
+                    marker.dispatch_event("click")
+                    page.wait_for_timeout(350)
+                except Exception:
+                    pass
+
+            if not popup.is_visible():
                 continue
 
-            html = popup.inner_html()
-            station_id = extract_station_id_from_html(html)
+            popup_html = popup.inner_html()
+            popup_text = popup.inner_text()
 
-            # Sometimes the URL is represented as a normal href; sometimes
-            # it is embedded in popup HTML/JavaScript.
-            if not station_id:
-                station_id = extract_station_id_from_html(popup.inner_text())
+            # 1) direct URL / ID in popup HTML.
+            sid = extract_station_id_from_text(popup_html)
+            if sid:
+                add_station(stations, sid, extract_station_name(popup_text, sid))
 
-            if not station_id:
-                continue
+            # 2) inspect/click any popup navigation control.
+            click_popup_station_control(page, popup, stations)
 
-            name = extract_station_name(popup.inner_text(), station_id)
-            url = STATION_URL.format(station_id)
+            # 3) popup may reveal a station name only. Scan the whole DOM
+            # after the click because DHM can create a hidden link/modal.
+            collect_station_links_from_dom(page, stations)
 
-            stations[station_id] = {
-                "url_id": station_id,
-                "name": name,
-                "url": url,
-            }
-
-            print(f"  [{len(stations)}] {name} -> {url}")
-
-        except Exception:
-            # One bad/covered marker should not stop the whole map scan.
-            continue
-
-        # Close popup so the next marker is clean.
-        try:
-            page.keyboard.press("Escape")
         except Exception:
             pass
+
+        finally:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+        if MAX_STATIONS and len(stations) >= MAX_STATIONS:
+            break
+
+    # Fallback: DHM exposes a Tabular View on the same page. On versions where
+    # Leaflet popups contain only rainfall values, the station rows may expose
+    # the station URL/data-id instead.
+    if not stations:
+        print("No station IDs found from markers; trying Tabular View fallback...")
+        try:
+            if click_text(page, "Tabular View", timeout=8000):
+                page.wait_for_timeout(2000)
+                collect_station_links_from_dom(page, stations)
+
+                # Inspect table rows for href/data attributes and station text.
+                tables = page.locator("table")
+                for ti in range(tables.count()):
+                    table = tables.nth(ti)
+                    rows = table.locator("tr")
+                    for ri in range(rows.count()):
+                        row = rows.nth(ri)
+                        try:
+                            html = row.inner_html()
+                            sid = extract_station_id_from_text(html)
+                            if sid:
+                                add_station(stations, sid, row.inner_text().splitlines()[0].strip())
+                        except Exception:
+                            continue
+        except Exception as exc:
+            print(f"Tabular View fallback failed: {exc}")
 
     save_debug(page, "01_after_station_discovery")
 
     result = list(stations.values())
-
     if MAX_STATIONS:
         result = result[:MAX_STATIONS]
 
