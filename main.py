@@ -180,20 +180,114 @@ def visible_station_panel(page):
     return ranked[0][1] if ranked else None
 
 
-def station_details(panel, sequence):
-    text = " ".join(panel.inner_text().split())
-    m = re.search(r"Station\s*:\s*(.+?)(?:\s*\|\s*District\s*:|\s+District\s*:|$)", text, re.I)
-    station_name = m.group(1).strip() if m else None
+def _normal_text(text):
+    return " ".join(str(text or "").split())
+
+
+def _extract_station_name(text):
+    text = _normal_text(text)
+
+    # The DHM interface normally renders: Station: NAME | District: ...
+    patterns = [
+        r"\bStation\s*:\s*(.+?)(?=\s*\|?\s*District\s*:)",
+        r"\bStation\s*:\s*(.+?)(?=\s+Station\s+Index\s*:)",
+        r"\bStation\s*Name\s*[:\-]\s*(.+?)(?=\s+(?:District|Station\s+Index)\s*:|$)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            value = m.group(1).strip(" |:-")
+            if value:
+                return value[:180]
+
+    # Handle label/value being separated by HTML elements.
+    lines = [x.strip() for x in str(text).splitlines() if x.strip()]
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"Station(?:\s+Name)?\s*[:\-]?", line, re.I) and i + 1 < len(lines):
+            value = lines[i + 1].strip()
+            if value and not re.match(r"^(District|Station\s+Index|Latitude|Longitude|Date|Period|VIEW)\b", value, re.I):
+                return value[:180]
+    return None
+
+
+def _extract_station_index(text):
+    text = _normal_text(text)
+    m = re.search(r"\bStation\s*Index\s*[:\-]?\s*([A-Za-z0-9_-]+)", text, re.I)
+    return m.group(1).strip() if m else None
+
+
+def station_details(page, panel, sequence):
+    # First inspect the selected station interface.
+    sources = []
+    try:
+        sources.append(("panel", panel.inner_text()))
+    except Exception:
+        pass
+
+    # The DHM page can put the station title/header in a parent or sibling
+    # of the form containing Station Index. Walk up the DOM and inspect each
+    # visible ancestor. Do not require Station and Station Index to be in the
+    # exact same smallest element.
+    try:
+        ancestors = panel.locator("xpath=ancestor::*")
+        count = ancestors.count()
+        for i in range(min(count, 8)):
+            el = ancestors.nth(i)
+            try:
+                if el.is_visible():
+                    sources.append((f"ancestor_{i}", el.inner_text()))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Finally inspect visible page/frame text outside the Leaflet map. This is
+    # important because DHM may render the Station label in a sibling/header
+    # while Station Index + VIEW live in the form body.
+    try:
+        body = page.locator("body")
+        body_text = body.inner_text()
+        sources.append(("body", body_text))
+    except Exception:
+        pass
+
+    for frame in page.frames:
+        try:
+            frame_text = frame.locator("body").inner_text(timeout=1000)
+            sources.append(("frame", frame_text))
+        except Exception:
+            pass
+
+    station_name = None
+    station_index = None
+
+    # Prefer a source that contains both pieces of station metadata.
+    for _, text in sources:
+        idx = _extract_station_index(text)
+        name = _extract_station_name(text)
+        if idx and name:
+            station_name, station_index = name, idx
+            break
+
+    # If the title and index are split between elements, take the first
+    # trustworthy value from all sources.
+    if not station_index:
+        for _, text in sources:
+            station_index = _extract_station_index(text)
+            if station_index:
+                break
     if not station_name:
-        m = re.search(r"Station\s*Name\s*[:\-]\s*(.+?)(?:\s+Station\s+Index|$)", text, re.I)
-        station_name = m.group(1).strip() if m else None
-    idx = re.search(r"Station\s*Index\s*[:\-]?\s*([A-Za-z0-9_-]+)", text, re.I)
-    station_index = idx.group(1).strip() if idx else None
+        for _, text in sources:
+            station_name = _extract_station_name(text)
+            if station_name:
+                break
+
     if not station_name:
-        raise RuntimeError(f"Station name not found in station interface for marker {sequence}.")
+        raise RuntimeError(f"Station name not found after marker {sequence}. The Station Index/VIEW interface was found, but the station title is rendered elsewhere in the DOM.")
     if not station_index:
         raise RuntimeError(f"Actual Station Index not found in station interface for marker {sequence}.")
-    return station_name[:180], station_index
+
+    return station_name, station_index
 
 
 def set_period_daily(panel):
@@ -375,7 +469,7 @@ def process_marker(page, marker, sequence):
     if panel is None:
         raise RuntimeError("Marker clicked, but no outside-map station interface appeared.")
 
-    station_name, station_index = station_details(panel, sequence)
+    station_name, station_index = station_details(page, panel, sequence)
     print(f"    Station: {station_name}")
     print(f"    Station Index: {station_index}")
     if DEBUG:
