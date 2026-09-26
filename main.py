@@ -37,9 +37,9 @@ DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
 
 MAP_URL = "https://dhm.gov.np/hydrology/rainfall-watch-map"
 
-# Set DEBUG_STATIONS=3 to process only first 3 stations.
+# Set DEBUG_STATIONS=1 to process only first station.
 # Example:
-#   DEBUG_STATIONS=3 python main.py
+#   DEBUG_STATIONS=1 python main.py
 DEBUG_STATIONS = int(os.environ.get("DEBUG_STATIONS", "0"))
 
 NEPAL_OFFSET = datetime.timedelta(hours=5, minutes=45)
@@ -94,7 +94,10 @@ def parse_date_token(token):
 
     for fmt in DATE_FORMATS:
         try:
-            return datetime.datetime.strptime(token, fmt).strftime("%Y-%m-%d")
+            return datetime.datetime.strptime(
+                token,
+                fmt
+            ).strftime("%Y-%m-%d")
         except ValueError:
             continue
 
@@ -119,10 +122,17 @@ def parse_number(text):
 def save_debug_file(tag, suffix, content):
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
-    safe = re.sub(r"[^\w.-]+", "_", tag)
+    safe = re.sub(
+        r"[^\w.-]+",
+        "_",
+        tag
+    )
 
     with open(
-        os.path.join(DEBUG_DIR, f"{safe}{suffix}"),
+        os.path.join(
+            DEBUG_DIR,
+            f"{safe}{suffix}"
+        ),
         "w",
         encoding="utf-8",
     ) as f:
@@ -174,81 +184,195 @@ def dump_element_html(page_or_panel, text_to_find):
 
 def open_station_via_filter(page, station_index, debug_tag=None):
     """
-    Set Filter type to Station No., pick station_index
-    in the Station Number dropdown, click Apply Filter.
+    DHM uses a two-stage filter:
+
+    1. Select "Station No." from the Filter Type dropdown.
+    2. Wait for the Station No. dropdown to appear/populate.
+    3. Select the requested station number.
+    4. Click Apply Filter.
 
     Returns True/False.
     """
 
-    selects = page.locator("select")
-
     filter_type_ok = False
     station_number_ok = False
+    apply_ok = False
+
+    # Always compare station numbers as strings.
+    station_index = str(station_index).strip()
 
     # --------------------------------------------------------
-    # Find and select "Station No." filter type
+    # STEP 1: Select "Station No." from Filter Type
     # --------------------------------------------------------
 
     try:
+
+        selects = page.locator("select")
+
         for i in range(selects.count()):
+
             sel = selects.nth(i)
 
-            opts = [
-                o.strip()
-                for o in sel.locator("option").all_inner_texts()
-            ]
+            try:
 
-            if any("station no" in o.lower() for o in opts):
+                opts = [
+                    o.strip()
+                    for o in sel.locator(
+                        "option"
+                    ).all_inner_texts()
+                ]
+
+            except Exception:
+
+                continue
+
+            if any(
+                "station no" in o.lower()
+                for o in opts
+            ):
 
                 match = next(
-                    o for o in opts
+                    o
+                    for o in opts
                     if "station no" in o.lower()
+                )
+
+                print(
+                    f"   selecting Filter Type: {match}"
                 )
 
                 sel.select_option(
                     label=match,
-                    timeout=2000,
+                    timeout=3000,
                 )
 
                 filter_type_ok = True
+
                 break
 
-    except Exception:
-        pass
+    except Exception as e:
+
+        print(
+            f"   Filter Type selection error: {e}"
+        )
+
+    if not filter_type_ok:
+
+        print(
+            "   Could not find/select "
+            "'Station No.' in Filter Type."
+        )
+
+        return False
 
     # --------------------------------------------------------
-    # Find and select station number
+    # STEP 2: WAIT FOR SECOND STATION NO. DROPDOWN
     # --------------------------------------------------------
 
-    try:
-        selects = page.locator("select")
+    print(
+        f"   waiting for Station No. dropdown "
+        f"containing {station_index}..."
+    )
 
-        for i in range(selects.count()):
-            sel = selects.nth(i)
+    # The second dropdown is dynamically created/populated
+    # after selecting "Station No.".
+    #
+    # Try repeatedly for up to 10 seconds.
+    for attempt in range(20):
 
-            opts = [
-                o.strip()
-                for o in sel.locator("option").all_inner_texts()
-            ]
+        try:
 
-            if station_index in opts:
+            page.wait_for_timeout(500)
 
-                sel.select_option(
-                    label=station_index,
-                    timeout=2000,
+            selects = page.locator("select")
+
+            for i in range(selects.count()):
+
+                sel = selects.nth(i)
+
+                try:
+
+                    opts = [
+                        o.strip()
+                        for o in sel.locator(
+                            "option"
+                        ).all_inner_texts()
+                    ]
+
+                except Exception:
+
+                    continue
+
+                # Look specifically for a dropdown containing
+                # the actual station number.
+                if station_index in opts:
+
+                    print(
+                        f"   found Station No. dropdown "
+                        f"containing {station_index}"
+                    )
+
+                    sel.select_option(
+                        label=station_index,
+                        timeout=3000,
+                    )
+
+                    station_number_ok = True
+
+                    print(
+                        f"   selected Station No.: "
+                        f"{station_index}"
+                    )
+
+                    break
+
+            if station_number_ok:
+                break
+
+        except Exception as e:
+
+            if attempt == 19:
+
+                print(
+                    f"   Station No. selection error: "
+                    f"{e}"
                 )
 
-                station_number_ok = True
-                break
-
-    except Exception:
-        pass
-
     # --------------------------------------------------------
-    # Click Apply Filter
+    # Station number not found
     # --------------------------------------------------------
 
-    apply_ok = False
+    if not station_number_ok:
+
+        print(
+            f"   Station number {station_index} "
+            f"was not found in the dropdown."
+        )
+
+        if debug_tag:
+
+            try:
+
+                save_debug_file(
+                    debug_tag,
+                    "_station_filter_debug.txt",
+                    page.locator(
+                        "body"
+                    ).inner_text(),
+                )
+
+            except Exception:
+                pass
+
+        return False
+
+    # --------------------------------------------------------
+    # STEP 3: Click Apply Filter
+    # --------------------------------------------------------
+
+    print(
+        "   clicking Apply Filter..."
+    )
 
     for selector in [
         "button:has-text('Apply Filter')",
@@ -257,26 +381,39 @@ def open_station_via_filter(page, station_index, debug_tag=None):
     ]:
 
         try:
-            page.locator(selector).first.click(timeout=3000)
 
-            apply_ok = True
-            break
+            button = page.locator(
+                selector
+            ).first
+
+            if button.is_visible():
+
+                button.click(
+                    timeout=5000
+                )
+
+                apply_ok = True
+
+                print(
+                    "   Apply Filter clicked."
+                )
+
+                break
 
         except Exception:
+
             continue
 
     # --------------------------------------------------------
-    # Debug screenshot / HTML
+    # DEBUG SCREENSHOT
     # --------------------------------------------------------
 
     if debug_tag:
 
         try:
+
             page.wait_for_timeout(1500)
 
-            # IMPORTANT:
-            # Do not put re.sub(... r"\w" ...) directly
-            # inside an f-string expression.
             safe_debug_tag = re.sub(
                 r"[^\w.-]+",
                 "_",
@@ -293,19 +430,9 @@ def open_station_via_filter(page, station_index, debug_tag=None):
         except Exception:
             pass
 
-        if not (
-            filter_type_ok
-            and station_number_ok
-            and apply_ok
-        ):
-            save_debug_file(
-                debug_tag,
-                "_sidebar_html.txt",
-                dump_element_html(
-                    page,
-                    "Apply Filter",
-                ),
-            )
+    # --------------------------------------------------------
+    # FINAL RESULT
+    # --------------------------------------------------------
 
     return (
         filter_type_ok
@@ -328,6 +455,7 @@ def get_marker_locator(page):
         loc = page.locator(selector)
 
         try:
+
             if loc.count() > 0:
                 return loc
 
@@ -359,6 +487,7 @@ def _candidate_panels(page):
     for selector in selectors:
 
         try:
+
             loc = page.locator(selector)
 
             for i in range(loc.count()):
@@ -377,7 +506,9 @@ def _candidate_panels(page):
                     if inside_map:
                         continue
 
-                    txt = el.inner_text(timeout=1000)
+                    txt = el.inner_text(
+                        timeout=1000
+                    )
 
                     if (
                         "station index" in txt.lower()
@@ -429,7 +560,9 @@ def set_period_to_daily_in_panel(panel):
 
             opts = [
                 o.strip()
-                for o in sel.locator("option").all_inner_texts()
+                for o in sel.locator(
+                    "option"
+                ).all_inner_texts()
             ]
 
             if any(
@@ -464,7 +597,9 @@ def click_view_in_panel(panel):
 
         try:
 
-            panel.locator(selector).first.click(
+            panel.locator(
+                selector
+            ).first.click(
                 timeout=3000
             )
 
@@ -486,17 +621,23 @@ def table_rows_from_panel(panel):
 
     try:
 
-        rows = panel.locator("table tr")
+        rows = panel.locator(
+            "table tr"
+        )
+
         count = rows.count()
 
     except Exception:
+
         return rows_data
 
     for i in range(count):
 
         try:
 
-            cells = rows.nth(i).locator("td, th")
+            cells = rows.nth(i).locator(
+                "td, th"
+            )
 
             texts = [
                 cells.nth(j).inner_text().strip()
@@ -504,6 +645,7 @@ def table_rows_from_panel(panel):
             ]
 
         except Exception:
+
             continue
 
         if len(texts) < 2:
@@ -583,7 +725,9 @@ def close_any_panel(page):
 
         try:
 
-            loc = page.locator(selector).last
+            loc = page.locator(
+                selector
+            ).last
 
             if loc.is_visible():
 
@@ -600,9 +744,11 @@ def close_any_panel(page):
             pass
 
     # Fallback
+
     try:
 
         page.keyboard.press("Escape")
+
         page.wait_for_timeout(250)
 
     except Exception:
@@ -622,13 +768,15 @@ def process_station(page, station, debug_tag=None):
     Raises on failure.
     """
 
-    station_index = station.get("station_index")
+    station_index = station.get(
+        "station_index"
+    )
 
     if not station_index:
 
         raise RuntimeError(
-            "This station has no station_index in stations.json "
-            "-- can't filter by it."
+            "This station has no station_index in "
+            "stations.json -- can't filter by it."
         )
 
     # --------------------------------------------------------
@@ -777,6 +925,7 @@ def process_station(page, station, debug_tag=None):
     )
 
     # Wait for table
+
     try:
 
         page.wait_for_timeout(2000)
@@ -834,7 +983,11 @@ def process_station(page, station, debug_tag=None):
 # EXCEL OUTPUT
 # ============================================================
 
-def append_all_rows(path, entries, run_timestamp):
+def append_all_rows(
+    path,
+    entries,
+    run_timestamp
+):
     """
     Dedup disabled while debugging.
     Every row is written every run.
@@ -859,7 +1012,9 @@ def append_all_rows(path, entries, run_timestamp):
             ]
         )
 
-    for date_str, daily_val, total_val in sorted(entries):
+    for date_str, daily_val, total_val in sorted(
+        entries
+    ):
 
         ws.append(
             [
@@ -937,7 +1092,8 @@ def main():
     with sync_playwright() as p:
 
         browser = p.chromium.launch(
-            headless=True
+            headless=False,
+            slow_mo=300
         )
 
         page = browser.new_page()
@@ -1059,3 +1215,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
