@@ -812,37 +812,47 @@ def set_popup_period_daily(popup, page):
     """
     Set DHM Period = Daily.
 
-    The Date field is deliberately NOT modified.
+    IMPORTANT:
+    DHM's Date / Period / VIEW controls are page-level controls
+    associated with the station chart. They are not reliably inside
+    the Leaflet popup.
 
-    DHM can render the station controls in different ways:
-      1. directly inside the Leaflet popup,
-      2. inside an iframe,
-      3. as page-level controls associated with the popup,
-      4. as a native <select>,
-      5. as a custom Bootstrap/select2 dropdown.
+    The chart is loaded asynchronously after a marker is clicked.
+    Therefore this function WAITS for the Period control instead of
+    checking only once.
 
-    We try all of these and VERIFY that Daily is selected.
+    DHM's current Period options are:
+        Point  -> value 1
+        Hourly -> value 2
+        Daily  -> value 3
+        3 Days -> value 4
     """
 
+    # ------------------------------------------------------------
+    # First give DHM's station/chart AJAX request time to render.
+    # ------------------------------------------------------------
+    page.wait_for_timeout(500)
+
+    # ------------------------------------------------------------
+    # The popup can contain an iframe in some versions/layouts.
+    # ------------------------------------------------------------
     roots = [
         ("popup", popup),
         ("page", page),
     ]
 
-    # ------------------------------------------------------------
-    # Check if the popup contains an iframe.
-    # ------------------------------------------------------------
     try:
         frames = popup.locator("iframe")
 
         for i in range(frames.count()):
-            iframe = frames.nth(i)
-
             try:
-                frame = iframe.content_frame
+                frame = frames.nth(i).content_frame
 
                 if frame is not None:
-                    roots.insert(0, (f"popup iframe {i}", frame))
+                    roots.insert(
+                        0,
+                        (f"popup iframe {i}", frame),
+                    )
             except Exception:
                 pass
 
@@ -850,79 +860,337 @@ def set_popup_period_daily(popup, page):
         pass
 
     # ------------------------------------------------------------
-    # DEBUG: show what Playwright can actually see.
+    # IMPORTANT:
+    # Retry because the chart controls are AJAX-rendered.
     # ------------------------------------------------------------
-    for label, root in roots:
-        _debug_period_controls(root, label)
+    deadline = time.time() + 12
 
-    # ------------------------------------------------------------
-    # 1. Native <select>.
-    # ------------------------------------------------------------
-    for label, root in roots:
-        if _try_select_daily(root, label):
-            return True
+    attempt = 0
 
-    # ------------------------------------------------------------
-    # 2. Custom dropdown.
-    # ------------------------------------------------------------
-    for label, root in roots:
-        if _try_custom_daily(root, label):
-            return True
+    while time.time() < deadline:
+        attempt += 1
 
-    # ------------------------------------------------------------
-    # 3. Last-resort JavaScript search.
-    #
-    # Find a visible SELECT anywhere in the document containing
-    # an option whose text/value is Daily.
-    # ------------------------------------------------------------
-    try:
-        result = page.evaluate(
-            """
-            () => {
-                const selects = [...document.querySelectorAll("select")];
+        # --------------------------------------------------------
+        # 1. Look for native SELECT first.
+        # --------------------------------------------------------
+        for label, root in roots:
 
-                for (const select of selects) {
-                    if (!select.offsetParent) continue;
+            try:
+                selects = root.locator("select")
 
-                    const option = [...select.options].find(
-                        o =>
-                            o.textContent.trim().toLowerCase() === "daily" ||
-                            (o.value || "").trim().toLowerCase() === "daily"
-                    );
+                for i in range(selects.count()):
+                    select = selects.nth(i)
 
-                    if (!option) continue;
+                    try:
+                        if not select.is_visible():
+                            continue
 
-                    select.value = option.value;
+                        options = select.locator("option")
 
-                    select.dispatchEvent(
-                        new Event("input", {bubbles: true})
-                    );
+                        option_info = []
 
-                    select.dispatchEvent(
-                        new Event("change", {bubbles: true})
-                    );
+                        for j in range(options.count()):
+                            option = options.nth(j)
 
-                    return {
-                        found: true,
-                        value: select.value,
-                        text: option.textContent.trim()
-                    };
+                            option_info.append({
+                                "text": option.inner_text().strip(),
+                                "value": (
+                                    option.get_attribute("value")
+                                    or ""
+                                ).strip(),
+                            })
+
+                        # We specifically need the Period select.
+                        daily = next(
+                            (
+                                x for x in option_info
+                                if x["text"].lower() == "daily"
+                                or x["value"].lower() == "daily"
+                            ),
+                            None,
+                        )
+
+                        if daily is None:
+                            continue
+
+                        print(
+                            f"    Found Period <select> in {label}: "
+                            f"{option_info}"
+                        )
+
+                        # ------------------------------------------------
+                        # DHM currently uses value="3" for Daily.
+                        # Prefer that exact value when available.
+                        # ------------------------------------------------
+                        daily_value = daily["value"]
+
+                        if not daily_value:
+                            daily_value = "3"
+
+                        selected = False
+
+                        # Normal Playwright selection.
+                        try:
+                            select.select_option(
+                                value=daily_value
+                            )
+                            selected = True
+                        except Exception:
+                            pass
+
+                        # ------------------------------------------------
+                        # Verify.
+                        # ------------------------------------------------
+                        if selected:
+                            try:
+                                selected_option = select.locator(
+                                    "option:checked"
+                                )
+
+                                selected_text = (
+                                    selected_option.inner_text()
+                                    .strip()
+                                    .lower()
+                                )
+
+                                selected_value = (
+                                    select.input_value()
+                                    .strip()
+                                    .lower()
+                                )
+
+                                if (
+                                    selected_text == "daily"
+                                    or selected_value == "daily"
+                                    or selected_value == "3"
+                                ):
+                                    print(
+                                        "    Period successfully "
+                                        "set to Daily."
+                                    )
+                                    return True
+
+                            except Exception:
+                                pass
+
+                        # ------------------------------------------------
+                        # JavaScript fallback on this exact SELECT.
+                        # ------------------------------------------------
+                        try:
+                            result = select.evaluate(
+                                """
+                                (el, desiredValue) => {
+                                    const option =
+                                        [...el.options].find(
+                                            o =>
+                                                o.value === desiredValue ||
+                                                o.textContent
+                                                    .trim()
+                                                    .toLowerCase()
+                                                    === "daily"
+                                        );
+
+                                    if (!option) {
+                                        return false;
+                                    }
+
+                                    el.value = option.value;
+
+                                    el.dispatchEvent(
+                                        new Event(
+                                            "input",
+                                            {bubbles: true}
+                                        )
+                                    );
+
+                                    el.dispatchEvent(
+                                        new Event(
+                                            "change",
+                                            {bubbles: true}
+                                        )
+                                    );
+
+                                    return (
+                                        el.value === option.value
+                                    );
+                                }
+                                """,
+                                daily_value,
+                            )
+
+                            if result:
+                                page.wait_for_timeout(250)
+
+                                selected_text = (
+                                    select.locator(
+                                        "option:checked"
+                                    ).inner_text()
+                                    .strip()
+                                    .lower()
+                                )
+
+                                if selected_text == "daily":
+                                    print(
+                                        "    Period set to Daily "
+                                        "via native change event."
+                                    )
+                                    return True
+
+                        except Exception:
+                            pass
+
+                    except Exception:
+                        continue
+
+            except Exception:
+                continue
+
+        # --------------------------------------------------------
+        # 2. Direct page-level JS search.
+        #
+        # This is deliberately repeated because DHM can replace
+        # the entire chart controls DOM after an AJAX response.
+        # --------------------------------------------------------
+        try:
+            result = page.evaluate(
+                """
+                () => {
+                    const selects =
+                        [...document.querySelectorAll("select")];
+
+                    for (const select of selects) {
+                        const options = [...select.options];
+
+                        const daily = options.find(
+                            o =>
+                                o.textContent
+                                    .trim()
+                                    .toLowerCase()
+                                    === "daily" ||
+                                (o.value || "")
+                                    .trim()
+                                    .toLowerCase()
+                                    === "daily"
+                        );
+
+                        if (!daily) continue;
+
+                        select.value = daily.value;
+
+                        select.dispatchEvent(
+                            new Event(
+                                "input",
+                                {bubbles: true}
+                            )
+                        );
+
+                        select.dispatchEvent(
+                            new Event(
+                                "change",
+                                {bubbles: true}
+                            )
+                        );
+
+                        return {
+                            found: true,
+                            value: select.value,
+                            text: daily.textContent.trim()
+                        };
+                    }
+
+                    return {found: false};
                 }
+                """
+            )
 
-                return {found: false};
-            }
-            """
-        )
+            if result.get("found"):
+                if (
+                    str(result.get("text", "")).lower()
+                    == "daily"
+                ):
+                    print(
+                        "    Period set to Daily "
+                        "using page JavaScript."
+                    )
+                    return True
 
-        if result.get("found") and (
-            result.get("text", "").lower() == "daily"
-            or result.get("value", "").lower() == "daily"
-        ):
-            print("    Period set to Daily using page JavaScript fallback.")
-            return True
+        except Exception:
+            pass
 
-    except Exception:
-        pass
+        # --------------------------------------------------------
+        # 3. Custom dropdown fallback.
+        # --------------------------------------------------------
+        for label, root in roots:
+
+            try:
+                candidates = root.locator(
+                    "[role='combobox'], "
+                    "[aria-haspopup='listbox'], "
+                    ".select2-selection, "
+                    ".dropdown-toggle"
+                )
+
+                for i in range(candidates.count()):
+                    candidate = candidates.nth(i)
+
+                    try:
+                        if not candidate.is_visible():
+                            continue
+
+                        candidate.click(force=True)
+                        time.sleep(0.2)
+
+                        daily_options = root.locator(
+                            "[role='option'], "
+                            "[role='menuitem'], "
+                            ".dropdown-item, "
+                            "li"
+                        )
+
+                        for j in range(
+                            daily_options.count()
+                        ):
+                            option = daily_options.nth(j)
+
+                            try:
+                                if (
+                                    option.is_visible()
+                                    and option.inner_text()
+                                    .strip()
+                                    .lower()
+                                    == "daily"
+                                ):
+                                    option.click(force=True)
+                                    page.wait_for_timeout(250)
+
+                                    print(
+                                        f"    Period set to Daily "
+                                        f"using custom dropdown "
+                                        f"in {label}."
+                                    )
+                                    return True
+
+                            except Exception:
+                                pass
+
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+        # --------------------------------------------------------
+        # Wait before checking again.
+        # --------------------------------------------------------
+        page.wait_for_timeout(400)
+
+    # ------------------------------------------------------------
+    # Final DEBUG information.
+    # ------------------------------------------------------------
+    _debug_period_controls(
+        page,
+        "FINAL Period inspection after 12 second wait",
+    )
 
     return False
 
@@ -1136,93 +1404,157 @@ def click_popup_view(popup, page):
 # ============================================================
 
 def read_rainfall_table_from_popup(
-    popup
+    popup,
+    page,
 ):
     """
-    Read all valid rainfall rows from the popup.
+    Read the DHM Accumulated Rainfall table after Period=Daily and
+    VIEW has been pressed.
+
+    IMPORTANT:
+    The Date / Period / VIEW controls and the Accumulated Rainfall
+    table are page-level elements.  They are not reliably children of
+    the Leaflet popup, so search both the popup and the full page.
+
+    Expected Daily table structure is:
+
+        Date | Daily | Total
+        Sat, Sep 26, 2026, 12:00 AM | 0.13 | 0.13
+        Fri, Sep 25, 2026, 12:00 AM | 25.57 | 25.70
+
+    Header names are used to locate the Daily and Total columns instead
+    of assuming fixed column positions.
     """
 
-    tables = popup.locator(
-        "table"
-    )
+    roots = [
+        ("page", page),
+        ("popup", popup),
+    ]
 
-    for i in range(
-        tables.count()
-    ):
+    seen = set()
 
-        table = tables.nth(i)
+    for root_name, root in roots:
+        try:
+            tables = root.locator("table")
+        except Exception:
+            continue
 
         try:
-
-            text = table.inner_text()
-            low = text.lower()
-
-            # Make sure this is the relevant table.
-            if "date" not in low:
-                continue
-
-            if "daily" not in low:
-                continue
-
-            rows = table.locator(
-                "tr"
-            )
-
-            extracted = []
-
-            for r in range(
-                rows.count()
-            ):
-
-                cells = rows.nth(
-                    r
-                ).locator(
-                    "th, td"
-                )
-
-                values = [
-                    x.strip()
-                    for x in cells.all_inner_texts()
-                ]
-
-                if len(values) < 2:
-                    continue
-
-                date_value = parse_date(
-                    values[0]
-                )
-
-                if not date_value:
-                    continue
-
-                daily_value = parse_number(
-                    values[1]
-                )
-
-                if daily_value is None:
-                    continue
-
-                total_value = (
-                    parse_number(
-                        values[2]
-                    )
-                    if len(values) >= 3
-                    else None
-                )
-
-                extracted.append(
-                    (
-                        date_value,
-                        daily_value,
-                        total_value,
-                    )
-                )
-
-            if extracted:
-                return extracted
-
+            table_count = tables.count()
         except Exception:
-            pass
+            continue
+
+        for i in range(table_count):
+            table = tables.nth(i)
+
+            try:
+                if not table.is_visible():
+                    continue
+
+                # Avoid processing the exact same DOM table twice when
+                # the popup happens to be represented in the page tree.
+                try:
+                    key = table.evaluate("el => el")
+                except Exception:
+                    key = f"{root_name}:{i}"
+
+                # We cannot safely hash a DOM node across Playwright
+                # handles, so use the root/index pair as the duplicate key.
+                key = f"{root_name}:{i}"
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                rows = table.locator("tr")
+                row_count = rows.count()
+                if row_count < 2:
+                    continue
+
+                # ----------------------------------------------------
+                # Find the header row and map Date/Daily/Total columns.
+                # ----------------------------------------------------
+                header_index = None
+                date_col = None
+                daily_col = None
+                total_col = None
+
+                for r in range(min(row_count, 5)):
+                    cells = rows.nth(r).locator("th, td")
+                    values = [
+                        x.strip()
+                        for x in cells.all_inner_texts()
+                    ]
+                    normalized = [
+                        re.sub(r"\s+", " ", x).strip().lower()
+                        for x in values
+                    ]
+
+                    for c, value in enumerate(normalized):
+                        if value == "date" or value.startswith("date "):
+                            date_col = c
+                        elif value == "daily" or "daily" in value:
+                            daily_col = c
+                        elif value == "total" or "total" in value:
+                            total_col = c
+
+                    if date_col is not None and daily_col is not None:
+                        header_index = r
+                        break
+
+                # The screenshot/table supplied by the user has exactly
+                # Date | Daily | Total, so this should be the normal path.
+                if header_index is None:
+                    continue
+
+                extracted = []
+
+                for r in range(header_index + 1, row_count):
+                    cells = rows.nth(r).locator("th, td")
+                    values = [
+                        x.strip()
+                        for x in cells.all_inner_texts()
+                    ]
+
+                    if not values:
+                        continue
+
+                    max_col = max(
+                        date_col,
+                        daily_col,
+                        total_col if total_col is not None else 0,
+                    )
+                    if len(values) <= max_col:
+                        continue
+
+                    date_value = parse_date(values[date_col])
+                    if not date_value:
+                        continue
+
+                    daily_value = parse_number(values[daily_col])
+                    if daily_value is None:
+                        continue
+
+                    total_value = None
+                    if total_col is not None and total_col < len(values):
+                        total_value = parse_number(values[total_col])
+
+                    extracted.append(
+                        (
+                            date_value,
+                            daily_value,
+                            total_value,
+                        )
+                    )
+
+                if extracted:
+                    print(
+                        f"    Found rainfall table in {root_name}: "
+                        f"Date/Daily columns, {len(extracted)} data row(s)."
+                    )
+                    return extracted
+
+            except Exception:
+                continue
 
     return []
 
@@ -1231,6 +1563,163 @@ def read_rainfall_table_from_popup(
 # EXTRACT YESTERDAY
 # ============================================================
 
+
+def set_page_date(page, target_date):
+    """
+    Set the DHM page-level Date field to target_date.
+
+    DHM's Date / Period / VIEW controls are page-level controls,
+    so the date input must be searched on the page rather than
+    assumed to be inside the Leaflet popup.
+
+    Returns True only when the input value is verified.
+    """
+
+    target = str(target_date)
+
+    # ------------------------------------------------------------
+    # Try native date inputs first.
+    # ------------------------------------------------------------
+    selectors = [
+        "input[type='date']",
+        "input[name='date']",
+        "#date",
+        "input[id*='date' i]",
+        "input[class*='date' i]",
+    ]
+
+    for selector in selectors:
+        try:
+            inputs = page.locator(selector)
+
+            for i in range(inputs.count()):
+                field = inputs.nth(i)
+
+                if not field.is_visible():
+                    continue
+
+                print(
+                    f"    Found Date input: {selector}"
+                )
+
+                # fill() works for native HTML date inputs.
+                try:
+                    field.fill(target)
+                except Exception:
+                    # JS fallback.
+                    field.evaluate(
+                        """
+                        (el, value) => {
+                            el.value = value;
+                            el.dispatchEvent(
+                                new Event(
+                                    "input",
+                                    {bubbles: true}
+                                )
+                            );
+                            el.dispatchEvent(
+                                new Event(
+                                    "change",
+                                    {bubbles: true}
+                                )
+                            );
+                        }
+                        """,
+                        target,
+                    )
+
+                page.wait_for_timeout(200)
+
+                try:
+                    actual = field.input_value().strip()
+
+                    if actual == target:
+                        print(
+                            f"    Date successfully set to {target}."
+                        )
+                        return True
+
+                except Exception:
+                    pass
+
+        except Exception:
+            continue
+
+    # ------------------------------------------------------------
+    # Last-resort JavaScript search.
+    # ------------------------------------------------------------
+    try:
+        result = page.evaluate(
+            """
+            (target) => {
+                const inputs =
+                    [...document.querySelectorAll("input")];
+
+                for (const input of inputs) {
+                    if (!input.offsetParent) continue;
+
+                    const type = (
+                        input.type || ""
+                    ).toLowerCase();
+
+                    const name = (
+                        input.name || ""
+                    ).toLowerCase();
+
+                    const id = (
+                        input.id || ""
+                    ).toLowerCase();
+
+                    const cls = (
+                        input.className || ""
+                    ).toString().toLowerCase();
+
+                    if (
+                        type !== "date" &&
+                        !name.includes("date") &&
+                        !id.includes("date") &&
+                        !cls.includes("date")
+                    ) {
+                        continue;
+                    }
+
+                    input.value = target;
+
+                    input.dispatchEvent(
+                        new Event(
+                            "input",
+                            {bubbles: true}
+                        )
+                    );
+
+                    input.dispatchEvent(
+                        new Event(
+                            "change",
+                            {bubbles: true}
+                        )
+                    );
+
+                    return input.value === target;
+                }
+
+                return false;
+            }
+            """,
+            target,
+        )
+
+        if result:
+            print(
+                f"    Date successfully set to {target} "
+                "using JavaScript."
+            )
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
 def extract_popup_rainfall(
     popup,
     page,
@@ -1238,14 +1727,21 @@ def extract_popup_rainfall(
     """
     Extract ONLY yesterday's rainfall.
 
-    Workflow:
-
-        1. Leave Date exactly as DHM opened it.
+    Primary workflow:
+        1. Leave DHM Date unchanged.
         2. Set Period = Daily.
         3. Click VIEW.
         4. Read the returned table.
-        5. Determine yesterday using AD/Gregorian date.
-        6. Keep only that row.
+        5. If yesterday is already present, use it.
+
+    Fallback workflow:
+        If DHM returned Daily data only for its currently selected
+        Date, set the page Date to yesterday, click VIEW again, and
+        read the Daily result.
+
+    This fallback is necessary because DHM's Date field acts as a
+    query/filter date; a Daily query for today's date does not
+    necessarily return yesterday's row.
     """
 
     target_date = yesterday_iso()
@@ -1254,73 +1750,146 @@ def extract_popup_rainfall(
         f"    Target AD date: {target_date}"
     )
 
-    # --------------------------------------------------------
-    # Period = Daily
-    # --------------------------------------------------------
+    # ============================================================
+    # STEP 1: Period = Daily
+    # ============================================================
 
-    daily_ok = (
-        set_popup_period_daily(
-            popup,
-            page,
-        )
-    )
-
-    if not daily_ok:
-
+    if not set_popup_period_daily(
+        popup,
+        page,
+    ):
         raise RuntimeError(
             "Period dropdown was not found "
             "or could not be set to Daily."
         )
 
-    # --------------------------------------------------------
-    # VIEW
-    # --------------------------------------------------------
+    # ============================================================
+    # STEP 2: VIEW
+    # ============================================================
 
     if not click_popup_view(
         popup,
         page,
     ):
-
         raise RuntimeError(
             "VIEW button was not found "
-            "inside the station popup."
+            "on the station page."
         )
 
-    # --------------------------------------------------------
-    # Wait for AJAX table.
-    # --------------------------------------------------------
+    # ============================================================
+    # STEP 3: Wait for the Daily table.
+    # ============================================================
+
+    print(
+        "    Waiting for Daily rainfall table..."
+    )
 
     for _ in range(30):
 
-        rows = (
-            read_rainfall_table_from_popup(
-                popup
-            )
+        rows = read_rainfall_table_from_popup(
+            popup,
+            page,
         )
 
         if rows:
-
-            # ------------------------------------------------
-            # Keep ONLY yesterday.
-            # ------------------------------------------------
+            print(
+                f"    Daily table returned "
+                f"{len(rows)} row(s)."
+            )
 
             yesterday_rows = [
                 row
                 for row in rows
-
                 if row[0] == target_date
             ]
 
             if yesterday_rows:
-
+                print(
+                    f"    Found yesterday "
+                    f"({target_date}) in returned table."
+                )
                 return yesterday_rows
 
-        time.sleep(0.5)
+        page.wait_for_timeout(500)
+
+    # ============================================================
+    # STEP 4: FALLBACK
+    #
+    # If today's Date query did not include yesterday, explicitly
+    # query DHM for yesterday.
+    # ============================================================
+
+    print(
+        f"    Yesterday ({target_date}) was not present "
+        "in the first Daily result."
+    )
+
+    print(
+        f"    Setting DHM Date to {target_date} "
+        "and requesting Daily data again..."
+    )
+
+    if not set_page_date(
+        page,
+        target_date,
+    ):
+        raise RuntimeError(
+            "Yesterday was not present in the Daily table, "
+            "and the DHM Date input could not be set to "
+            f"{target_date}."
+        )
+
+    # Re-apply Daily because DHM may rebuild the controls/table
+    # after the Date field changes.
+    if not set_popup_period_daily(
+        popup,
+        page,
+    ):
+        raise RuntimeError(
+            "Period could not be reset to Daily "
+            "after changing the Date."
+        )
+
+    if not click_popup_view(
+        popup,
+        page,
+    ):
+        raise RuntimeError(
+            "VIEW button could not be clicked "
+            "after changing the Date."
+        )
+
+    # ============================================================
+    # STEP 5: Read the second result.
+    # ============================================================
+
+    for _ in range(30):
+
+        rows = read_rainfall_table_from_popup(
+            popup,
+            page,
+        )
+
+        if rows:
+            yesterday_rows = [
+                row
+                for row in rows
+                if row[0] == target_date
+            ]
+
+            if yesterday_rows:
+                print(
+                    f"    Found yesterday "
+                    f"({target_date}) after Date fallback."
+                )
+                return yesterday_rows
+
+        page.wait_for_timeout(500)
 
     raise RuntimeError(
-        "Daily rainfall table loaded, "
-        f"but no row was found for "
-        f"yesterday ({target_date})."
+        "Daily rainfall table loaded, but no row was found "
+        f"for yesterday ({target_date}) even after querying "
+        "DHM with yesterday's Date."
     )
 
 
