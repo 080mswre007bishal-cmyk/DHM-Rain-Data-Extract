@@ -1,16 +1,12 @@
+```yaml
 name: Debug Rainfall Extraction
 
-# Run this manually from the Actions tab BEFORE trusting the twice-daily
-# job: Actions -> "Debug Rainfall Extraction" -> "Run workflow". It tests
-# a few stations and saves a screenshot + the page text from right after
-# clicking VIEW for each one, as a downloadable zip attached to the run
-# (look for "Artifacts" at the bottom of the run's summary page).
+# Run this manually from the Actions tab.
+# It tests a selected number of stations, creates the normal Excel files,
+# and also uploads/updates those Excel files in Google Drive.
 #
-# Open each screenshot next to its matching .txt file and check: is the
-# number main.py picked out actually the 24h rainfall figure shown on
-# the page? If not, edit extract_daily_rainfall() in main.py (you can
-# edit it right here on GitHub -- open main.py, click the pencil icon)
-# using that .txt file as your reference for what really appears.
+# It also saves screenshots + page text as downloadable GitHub artifacts.
+
 on:
   workflow_dispatch:
     inputs:
@@ -22,6 +18,7 @@ on:
 jobs:
   debug:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,14 +31,18 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Run debug scrape (no Drive upload happens in debug mode)
+      - name: Run debug scrape + Google Drive upload
         env:
           DEBUG_STATIONS: ${{ github.event.inputs.station_count }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: python main.py
 
-      - name: Upload debug screenshots + text
+      - name: Upload debug screenshots + text + Excel files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-output
-          path: output/debug/
+          name: debug-output-${{ github.run_id }}
+          path: output/
           retention-days: 7
+```
