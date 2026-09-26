@@ -15,6 +15,10 @@ For every station in stations.json:
   5. Skip today's row and write the rest to output/<station>.xlsx.
 
 Dedup is currently OFF while debugging -- every row gets written every run.
+
+This version works in:
+  - Windows CMD / local computer: headed browser
+  - GitHub Actions: headless browser
 """
 
 import datetime
@@ -38,11 +42,19 @@ DEBUG_DIR = os.path.join(OUTPUT_DIR, "debug")
 MAP_URL = "https://dhm.gov.np/hydrology/rainfall-watch-map"
 
 # Set DEBUG_STATIONS=1 to process only first station.
+#
 # Example:
 #   DEBUG_STATIONS=1 python main.py
-DEBUG_STATIONS = int(os.environ.get("DEBUG_STATIONS", "0"))
+#
+# Set DEBUG_STATIONS=5 to process first 5 stations.
+DEBUG_STATIONS = int(
+    os.environ.get("DEBUG_STATIONS", "0")
+)
 
-NEPAL_OFFSET = datetime.timedelta(hours=5, minutes=45)
+NEPAL_OFFSET = datetime.timedelta(
+    hours=5,
+    minutes=45
+)
 
 
 # ============================================================
@@ -75,14 +87,28 @@ DATE_PATTERNS = [
 # ============================================================
 
 def safe_filename(name, station_index, url_id):
+
     base = station_index or url_id
-    clean_name = re.sub(r"[^\w\-]+", "_", name).strip("_")
+
+    clean_name = re.sub(
+        r"[^\w\-]+",
+        "_",
+        name
+    ).strip("_")
+
     return f"{base}_{clean_name}.xlsx"
 
 
 def nepal_today_iso():
-    now_npt = datetime.datetime.utcnow() + NEPAL_OFFSET
-    return now_npt.date().strftime("%Y-%m-%d")
+
+    now_npt = (
+        datetime.datetime.utcnow()
+        + NEPAL_OFFSET
+    )
+
+    return now_npt.date().strftime(
+        "%Y-%m-%d"
+    )
 
 
 # ============================================================
@@ -90,22 +116,31 @@ def nepal_today_iso():
 # ============================================================
 
 def parse_date_token(token):
+
     token = token.strip()
 
     for fmt in DATE_FORMATS:
+
         try:
+
             return datetime.datetime.strptime(
                 token,
                 fmt
             ).strftime("%Y-%m-%d")
+
         except ValueError:
+
             continue
 
     return None
 
 
 def parse_number(text):
-    matches = re.findall(r"\d+\.\d+|\d+", text)
+
+    matches = re.findall(
+        r"\d+\.\d+|\d+",
+        text
+    )
 
     if not matches:
         return None
@@ -119,8 +154,16 @@ def parse_number(text):
 # DEBUG HELPERS
 # ============================================================
 
-def save_debug_file(tag, suffix, content):
-    os.makedirs(DEBUG_DIR, exist_ok=True)
+def save_debug_file(
+    tag,
+    suffix,
+    content
+):
+
+    os.makedirs(
+        DEBUG_DIR,
+        exist_ok=True
+    )
 
     safe = re.sub(
         r"[^\w.-]+",
@@ -136,10 +179,15 @@ def save_debug_file(tag, suffix, content):
         "w",
         encoding="utf-8",
     ) as f:
+
         f.write(content)
 
 
-def dump_element_html(page_or_panel, text_to_find):
+def dump_element_html(
+    page_or_panel,
+    text_to_find
+):
+
     """
     Find the DOM node whose exact text is text_to_find,
     walk up a few parent levels, and return its outerHTML.
@@ -148,6 +196,7 @@ def dump_element_html(page_or_panel, text_to_find):
     """
 
     try:
+
         return page_or_panel.evaluate(
             """(target) => {
                 const walker = document.createTreeWalker(
@@ -158,10 +207,16 @@ def dump_element_html(page_or_panel, text_to_find):
                 let node;
 
                 while (node = walker.nextNode()) {
+
                     if (node.textContent.trim() === target) {
+
                         let el = node.parentElement;
 
-                        for (let i = 0; i < 4 && el.parentElement; i++) {
+                        for (
+                            let i = 0;
+                            i < 4 && el.parentElement;
+                            i++
+                        ) {
                             el = el.parentElement;
                         }
 
@@ -169,20 +224,30 @@ def dump_element_html(page_or_panel, text_to_find):
                     }
                 }
 
-                return 'NO NODE WITH EXACT TEXT "' + target + '" FOUND';
+                return 'NO NODE WITH EXACT TEXT "' +
+                    target +
+                    '" FOUND';
             }""",
             text_to_find,
         )
 
     except Exception as e:
-        return f"ERROR while extracting: {e}"
+
+        return (
+            f"ERROR while extracting: {e}"
+        )
 
 
 # ============================================================
 # STATION FILTER
 # ============================================================
 
-def open_station_via_filter(page, station_index, debug_tag=None):
+def open_station_via_filter(
+    page,
+    station_index,
+    debug_tag=None
+):
+
     """
     DHM uses a two-stage filter:
 
@@ -199,7 +264,10 @@ def open_station_via_filter(page, station_index, debug_tag=None):
     apply_ok = False
 
     # Always compare station numbers as strings.
-    station_index = str(station_index).strip()
+
+    station_index = str(
+        station_index
+    ).strip()
 
     # --------------------------------------------------------
     # STEP 1: Select "Station No." from Filter Type
@@ -207,9 +275,13 @@ def open_station_via_filter(page, station_index, debug_tag=None):
 
     try:
 
-        selects = page.locator("select")
+        selects = page.locator(
+            "select"
+        )
 
-        for i in range(selects.count()):
+        for i in range(
+            selects.count()
+        ):
 
             sel = selects.nth(i)
 
@@ -278,15 +350,22 @@ def open_station_via_filter(page, station_index, debug_tag=None):
     # after selecting "Station No.".
     #
     # Try repeatedly for up to 10 seconds.
+
     for attempt in range(20):
 
         try:
 
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(
+                500
+            )
 
-            selects = page.locator("select")
+            selects = page.locator(
+                "select"
+            )
 
-            for i in range(selects.count()):
+            for i in range(
+                selects.count()
+            ):
 
                 sel = selects.nth(i)
 
@@ -305,6 +384,7 @@ def open_station_via_filter(page, station_index, debug_tag=None):
 
                 # Look specifically for a dropdown containing
                 # the actual station number.
+
                 if station_index in opts:
 
                     print(
@@ -362,6 +442,7 @@ def open_station_via_filter(page, station_index, debug_tag=None):
                 )
 
             except Exception:
+
                 pass
 
         return False
@@ -412,7 +493,9 @@ def open_station_via_filter(page, station_index, debug_tag=None):
 
         try:
 
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(
+                1500
+            )
 
             safe_debug_tag = re.sub(
                 r"[^\w.-]+",
@@ -428,6 +511,7 @@ def open_station_via_filter(page, station_index, debug_tag=None):
             )
 
         except Exception:
+
             pass
 
     # --------------------------------------------------------
@@ -452,14 +536,18 @@ def get_marker_locator(page):
         ".leaflet-container .leaflet-marker-icon",
     ]:
 
-        loc = page.locator(selector)
+        loc = page.locator(
+            selector
+        )
 
         try:
 
             if loc.count() > 0:
+
                 return loc
 
         except Exception:
+
             pass
 
     return None
@@ -488,9 +576,13 @@ def _candidate_panels(page):
 
         try:
 
-            loc = page.locator(selector)
+            loc = page.locator(
+                selector
+            )
 
-            for i in range(loc.count()):
+            for i in range(
+                loc.count()
+            ):
 
                 el = loc.nth(i)
 
@@ -511,15 +603,22 @@ def _candidate_panels(page):
                     )
 
                     if (
-                        "station index" in txt.lower()
-                        and "view" in txt.lower()
+                        "station index"
+                        in txt.lower()
+                        and "view"
+                        in txt.lower()
                     ):
-                        result.append(el)
+
+                        result.append(
+                            el
+                        )
 
                 except Exception:
+
                     pass
 
         except Exception:
+
             pass
 
     return result
@@ -527,14 +626,19 @@ def _candidate_panels(page):
 
 def find_station_panel(page):
 
-    panels = _candidate_panels(page)
+    panels = _candidate_panels(
+        page
+    )
 
     if not panels:
+
         return None
 
     ranked = sorted(
         panels,
-        key=lambda p: len(p.inner_text()),
+        key=lambda p: len(
+            p.inner_text()
+        ),
     )
 
     return ranked[0]
@@ -544,15 +648,22 @@ def find_station_panel(page):
 # DAILY PERIOD
 # ============================================================
 
-def set_period_to_daily_in_panel(panel):
+def set_period_to_daily_in_panel(
+    panel
+):
+
     """
     Real <select>-based Period control,
     scoped to just this panel.
     """
 
-    selects = panel.locator("select")
+    selects = panel.locator(
+        "select"
+    )
 
-    for i in range(selects.count()):
+    for i in range(
+        selects.count()
+    ):
 
         sel = selects.nth(i)
 
@@ -578,6 +689,7 @@ def set_period_to_daily_in_panel(panel):
                 return True
 
         except Exception:
+
             continue
 
     return False
@@ -587,7 +699,9 @@ def set_period_to_daily_in_panel(panel):
 # VIEW BUTTON
 # ============================================================
 
-def click_view_in_panel(panel):
+def click_view_in_panel(
+    panel
+):
 
     for selector in [
         "text=VIEW",
@@ -606,6 +720,7 @@ def click_view_in_panel(panel):
             return True
 
         except Exception:
+
             continue
 
     return False
@@ -615,7 +730,9 @@ def click_view_in_panel(panel):
 # TABLE PARSING
 # ============================================================
 
-def table_rows_from_panel(panel):
+def table_rows_from_panel(
+    panel
+):
 
     rows_data = []
 
@@ -631,7 +748,9 @@ def table_rows_from_panel(panel):
 
         return rows_data
 
-    for i in range(count):
+    for i in range(
+        count
+    ):
 
         try:
 
@@ -641,7 +760,9 @@ def table_rows_from_panel(panel):
 
             texts = [
                 cells.nth(j).inner_text().strip()
-                for j in range(cells.count())
+                for j in range(
+                    cells.count()
+                )
             ]
 
         except Exception:
@@ -649,6 +770,7 @@ def table_rows_from_panel(panel):
             continue
 
         if len(texts) < 2:
+
             continue
 
         # ----------------------------------------------------
@@ -671,9 +793,11 @@ def table_rows_from_panel(panel):
                 )
 
                 if date_str:
+
                     break
 
         if not date_str:
+
             continue
 
         # ----------------------------------------------------
@@ -713,7 +837,9 @@ def table_rows_from_panel(panel):
 # CLOSE PANEL
 # ============================================================
 
-def close_any_panel(page):
+def close_any_panel(
+    page
+):
 
     for selector in [
         "[aria-label='Close']:visible",
@@ -736,22 +862,30 @@ def close_any_panel(page):
                     timeout=1000,
                 )
 
-                page.wait_for_timeout(250)
+                page.wait_for_timeout(
+                    250
+                )
 
                 return
 
         except Exception:
+
             pass
 
     # Fallback
 
     try:
 
-        page.keyboard.press("Escape")
+        page.keyboard.press(
+            "Escape"
+        )
 
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(
+            250
+        )
 
     except Exception:
+
         pass
 
 
@@ -759,7 +893,12 @@ def close_any_panel(page):
 # PROCESS ONE STATION
 # ============================================================
 
-def process_station(page, station, debug_tag=None):
+def process_station(
+    page,
+    station,
+    debug_tag=None
+):
+
     """
     Returns list of:
         (date_str, daily_value, total_value)
@@ -789,16 +928,20 @@ def process_station(page, station, debug_tag=None):
         timeout=30000,
     )
 
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(
+        2000
+    )
 
     # --------------------------------------------------------
     # Apply station filter
     # --------------------------------------------------------
 
-    filtered_ok = open_station_via_filter(
-        page,
-        station_index,
-        debug_tag=debug_tag,
+    filtered_ok = (
+        open_station_via_filter(
+            page,
+            station_index,
+            debug_tag=debug_tag,
+        )
     )
 
     if not filtered_ok:
@@ -816,17 +959,25 @@ def process_station(page, station, debug_tag=None):
 
     for _ in range(20):
 
-        panel = find_station_panel(page)
+        panel = find_station_panel(
+            page
+        )
 
         if panel is not None:
+
             break
 
         # Popup may need an explicit marker click
         # after filtering.
 
-        markers = get_marker_locator(page)
+        markers = get_marker_locator(
+            page
+        )
 
-        if markers and markers.count() > 0:
+        if (
+            markers
+            and markers.count() > 0
+        ):
 
             try:
 
@@ -836,9 +987,12 @@ def process_station(page, station, debug_tag=None):
                 )
 
             except Exception:
+
                 pass
 
-        time.sleep(0.5)
+        time.sleep(
+            0.5
+        )
 
     # --------------------------------------------------------
     # No panel
@@ -853,7 +1007,7 @@ def process_station(page, station, debug_tag=None):
                 safe_debug_tag = re.sub(
                     r"[^\w.-]+",
                     "_",
-                    debug_tag,
+                    debug_tag
                 )
 
                 page.screenshot(
@@ -864,6 +1018,7 @@ def process_station(page, station, debug_tag=None):
                 )
 
             except Exception:
+
                 pass
 
         raise RuntimeError(
@@ -893,6 +1048,7 @@ def process_station(page, station, debug_tag=None):
             )
 
         except Exception:
+
             pass
 
         try:
@@ -906,40 +1062,51 @@ def process_station(page, station, debug_tag=None):
             )
 
         except Exception:
+
             pass
 
     # --------------------------------------------------------
     # Select Daily
     # --------------------------------------------------------
 
-    period_ok = set_period_to_daily_in_panel(
-        panel
+    period_ok = (
+        set_period_to_daily_in_panel(
+            panel
+        )
     )
 
     # --------------------------------------------------------
     # Click VIEW
     # --------------------------------------------------------
 
-    view_ok = click_view_in_panel(
-        panel
+    view_ok = (
+        click_view_in_panel(
+            panel
+        )
     )
 
     # Wait for table
 
     try:
 
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(
+            2000
+        )
 
     except Exception:
 
-        time.sleep(2)
+        time.sleep(
+            2
+        )
 
     # --------------------------------------------------------
     # Read table
     # --------------------------------------------------------
 
-    all_rows = table_rows_from_panel(
-        panel
+    all_rows = (
+        table_rows_from_panel(
+            panel
+        )
     )
 
     # --------------------------------------------------------
@@ -974,7 +1141,9 @@ def process_station(page, station, debug_tag=None):
     # Close popup
     # --------------------------------------------------------
 
-    close_any_panel(page)
+    close_any_panel(
+        page
+    )
 
     return kept_rows
 
@@ -988,6 +1157,7 @@ def append_all_rows(
     entries,
     run_timestamp
 ):
+
     """
     Dedup disabled while debugging.
     Every row is written every run.
@@ -995,12 +1165,16 @@ def append_all_rows(
 
     if os.path.exists(path):
 
-        wb = load_workbook(path)
+        wb = load_workbook(
+            path
+        )
+
         ws = wb.active
 
     else:
 
         wb = Workbook()
+
         ws = wb.active
 
         ws.append(
@@ -1012,9 +1186,11 @@ def append_all_rows(
             ]
         )
 
-    for date_str, daily_val, total_val in sorted(
-        entries
-    ):
+    for (
+        date_str,
+        daily_val,
+        total_val
+    ) in sorted(entries):
 
         ws.append(
             [
@@ -1025,7 +1201,9 @@ def append_all_rows(
             ]
         )
 
-    wb.save(path)
+    wb.save(
+        path
+    )
 
 
 # ============================================================
@@ -1053,7 +1231,9 @@ def main():
         encoding="utf-8",
     ) as f:
 
-        stations = json.load(f)
+        stations = json.load(
+            f
+        )
 
     # --------------------------------------------------------
     # Debug mode
@@ -1061,7 +1241,9 @@ def main():
 
     if DEBUG_STATIONS:
 
-        stations = stations[:DEBUG_STATIONS]
+        stations = stations[
+            :DEBUG_STATIONS
+        ]
 
         print(
             f"DEBUG MODE: running only "
@@ -1082,7 +1264,9 @@ def main():
 
     run_timestamp = (
         datetime.datetime.utcnow()
-        .strftime("%Y-%m-%d %H:%M:%S")
+        .strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     )
 
     # --------------------------------------------------------
@@ -1091,9 +1275,49 @@ def main():
 
     with sync_playwright() as p:
 
+        # GitHub Actions automatically sets this environment
+        # variable to "true".
+        #
+        # Local Windows:
+        #     GITHUB_ACTIONS is normally not set
+        #     -> headed browser
+        #
+        # GitHub Actions:
+        #     GITHUB_ACTIONS=true
+        #     -> headless browser
+        #
+        # This fixes:
+        #
+        # TargetClosedError:
+        # BrowserType.launch:
+        # Looks like you launched a headed browser
+        # without having a XServer running.
+
+        is_github_actions = (
+            os.environ.get(
+                "GITHUB_ACTIONS",
+                ""
+            ).lower()
+            == "true"
+        )
+
+        if is_github_actions:
+
+            print(
+                "Browser mode: "
+                "HEADLESS (GitHub Actions)"
+            )
+
+        else:
+
+            print(
+                "Browser mode: "
+                "HEADED (local computer)"
+            )
+
         browser = p.chromium.launch(
-            headless=False,
-            slow_mo=300
+            headless=is_github_actions,
+            slow_mo=300,
         )
 
         page = browser.new_page()
@@ -1104,8 +1328,13 @@ def main():
 
         for station in stations:
 
-            url_id = station["url_id"]
-            name = station["name"]
+            url_id = station[
+                "url_id"
+            ]
+
+            name = station[
+                "name"
+            ]
 
             print(
                 f"-> {name} "
@@ -1115,7 +1344,9 @@ def main():
 
             filename = safe_filename(
                 name,
-                station.get("station_index"),
+                station.get(
+                    "station_index"
+                ),
                 url_id,
             )
 
@@ -1198,7 +1429,9 @@ def main():
                     "nothing written"
                 )
 
-            time.sleep(0.5)
+            time.sleep(
+                0.5
+            )
 
         # ----------------------------------------------------
         # Close browser
@@ -1206,7 +1439,9 @@ def main():
 
         browser.close()
 
-    print("Done.")
+    print(
+        "Done."
+    )
 
 
 # ============================================================
@@ -1214,5 +1449,6 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
 
