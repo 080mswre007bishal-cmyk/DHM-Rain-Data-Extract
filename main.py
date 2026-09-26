@@ -32,6 +32,8 @@ Each station spreadsheet contains:
 
     Date | Daily Rainfall (mm)
 
+There are NO station folders.
+
 Duplicate checking is performed by DATE because each
 Google Spreadsheet belongs to only one station.
 
@@ -47,7 +49,6 @@ import re
 import time
 
 from openpyxl import Workbook, load_workbook
-
 from playwright.sync_api import sync_playwright
 
 from google.oauth2.credentials import Credentials
@@ -72,10 +73,11 @@ MAP_URL = (
     "hydrology/rainfall-watch-map"
 )
 
-# Google Drive folder containing all station spreadsheets.
+# Existing Google Drive folder.
+# All station spreadsheets go DIRECTLY inside this folder.
 GOOGLE_FOLDER_NAME = "DHM Rainfall"
 
-# Name of the worksheet/tab inside every station spreadsheet.
+# Worksheet/tab inside every station spreadsheet.
 GOOGLE_SHEET_TAB = "Rainfall"
 
 # Google OAuth scopes.
@@ -85,9 +87,9 @@ GOOGLE_SCOPES = [
 ]
 
 
-# ------------------------------------------------------------
-# Debug mode
-# ------------------------------------------------------------
+# ============================================================
+# DEBUG STATION CONTROL
+# ============================================================
 
 # DEBUG_STATIONS=1
 #     -> process only first station
@@ -106,9 +108,9 @@ DEBUG_STATIONS = int(
 )
 
 
-# ------------------------------------------------------------
-# Nepal time
-# ------------------------------------------------------------
+# ============================================================
+# NEPAL TIME
+# ============================================================
 
 NEPAL_OFFSET = datetime.timedelta(
     hours=5,
@@ -122,6 +124,7 @@ NEPAL_OFFSET = datetime.timedelta(
 
 DATE_FORMATS = [
     "%a, %b %d, %Y, %I:%M %p",
+    "%a, %b %d, %Y",
     "%Y-%m-%d",
     "%d %b, %Y",
     "%d %B, %Y",
@@ -174,10 +177,10 @@ def safe_google_name(
     url_id
 ):
     """
-    Creates the name of the individual Google Spreadsheet.
+    Creates the individual Google Spreadsheet name.
 
     Example:
-        1001_Dipayal
+        1009_Chautara
     """
 
     base = (
@@ -193,6 +196,7 @@ def safe_google_name(
     ).strip("_")
 
     if clean_name:
+
         return (
             f"{base}_{clean_name}"
         )
@@ -202,8 +206,10 @@ def safe_google_name(
 
 def nepal_today_iso():
 
+    now_utc = datetime.datetime.utcnow()
+
     now_npt = (
-        datetime.datetime.utcnow()
+        now_utc
         + NEPAL_OFFSET
     )
 
@@ -240,6 +246,31 @@ def parse_date_token(token):
 
 def parse_number(text):
 
+    if text is None:
+
+        return None
+
+    text = str(text).strip()
+
+    # Remove commas from numbers.
+    text = text.replace(
+        ",",
+        ""
+    )
+
+    # Handle common missing-value indicators.
+    if text.lower() in {
+        "",
+        "-",
+        "--",
+        "n/a",
+        "na",
+        "null",
+        "none",
+    }:
+
+        return None
+
     matches = re.findall(
         r"\d+\.\d+|\d+",
         text
@@ -249,9 +280,15 @@ def parse_number(text):
 
         return None
 
-    val = float(
-        matches[0]
-    )
+    try:
+
+        val = float(
+            matches[0]
+        )
+
+    except ValueError:
+
+        return None
 
     return (
         val
@@ -290,61 +327,8 @@ def save_debug_file(
         encoding="utf-8",
     ) as f:
 
-        f.write(content)
-
-
-def dump_element_html(
-    page_or_panel,
-    text_to_find
-):
-
-    """
-    Find the DOM node whose exact text is text_to_find,
-    walk up a few parent levels, and return its outerHTML.
-
-    Returns a message string if not found.
-    """
-
-    try:
-
-        return page_or_panel.evaluate(
-            """(target) => {
-                const walker = document.createTreeWalker(
-                    document.body,
-                    NodeFilter.SHOW_TEXT
-                );
-
-                let node;
-
-                while (node = walker.nextNode()) {
-
-                    if (node.textContent.trim() === target) {
-
-                        let el = node.parentElement;
-
-                        for (
-                            let i = 0;
-                            i < 4 && el.parentElement;
-                            i++
-                        ) {
-                            el = el.parentElement;
-                        }
-
-                        return el.outerHTML;
-                    }
-                }
-
-                return 'NO NODE WITH EXACT TEXT "' +
-                    target +
-                    '" FOUND';
-            }""",
-            text_to_find,
-        )
-
-    except Exception as e:
-
-        return (
-            f"ERROR while extracting: {e}"
+        f.write(
+            str(content)
         )
 
 
@@ -357,16 +341,13 @@ def open_station_via_filter(
     station_index,
     debug_tag=None
 ):
-
     """
     DHM uses a two-stage filter:
 
-    1. Select "Station No." from the Filter Type dropdown.
-    2. Wait for the Station No. dropdown to appear/populate.
+    1. Select "Station No.".
+    2. Wait for the Station No. dropdown.
     3. Select the requested station number.
     4. Click Apply Filter.
-
-    Returns True/False.
     """
 
     filter_type_ok = False
@@ -378,7 +359,7 @@ def open_station_via_filter(
     ).strip()
 
     # --------------------------------------------------------
-    # STEP 1: Select "Station No."
+    # STEP 1: Select Station No.
     # --------------------------------------------------------
 
     try:
@@ -406,24 +387,28 @@ def open_station_via_filter(
 
                 continue
 
-            if any(
-                "station no" in o.lower()
-                for o in opts
-            ):
+            matching_option = None
 
-                match = next(
-                    o
-                    for o in opts
-                    if "station no" in o.lower()
-                )
+            for option in opts:
+
+                if (
+                    "station no"
+                    in option.lower()
+                ):
+
+                    matching_option = option
+
+                    break
+
+            if matching_option:
 
                 print(
                     f"   selecting Filter Type: "
-                    f"{match}"
+                    f"{matching_option}"
                 )
 
                 sel.select_option(
-                    label=match,
+                    label=matching_option,
                     timeout=3000,
                 )
 
@@ -448,7 +433,7 @@ def open_station_via_filter(
         return False
 
     # --------------------------------------------------------
-    # STEP 2: WAIT FOR STATION NUMBER DROPDOWN
+    # STEP 2: Wait for station number dropdown
     # --------------------------------------------------------
 
     print(
@@ -456,7 +441,7 @@ def open_station_via_filter(
         f"containing {station_index}..."
     )
 
-    for attempt in range(20):
+    for attempt in range(30):
 
         try:
 
@@ -515,7 +500,7 @@ def open_station_via_filter(
 
         except Exception as e:
 
-            if attempt == 19:
+            if attempt == 29:
 
                 print(
                     f"   Station No. selection "
@@ -586,17 +571,27 @@ def open_station_via_filter(
 
             continue
 
+    if not apply_ok:
+
+        print(
+            "   Could not click Apply Filter."
+        )
+
     # --------------------------------------------------------
-    # DEBUG SCREENSHOT
+    # Wait for filtered map
+    # --------------------------------------------------------
+
+    page.wait_for_timeout(
+        2000
+    )
+
+    # --------------------------------------------------------
+    # Debug screenshot
     # --------------------------------------------------------
 
     if debug_tag:
 
         try:
-
-            page.wait_for_timeout(
-                1500
-            )
 
             safe_debug_tag = re.sub(
                 r"[^\w.-]+",
@@ -633,11 +628,11 @@ def get_marker_locator(page):
         ".leaflet-container .leaflet-marker-icon",
     ]:
 
-        loc = page.locator(
-            selector
-        )
-
         try:
+
+            loc = page.locator(
+                selector
+            )
 
             if loc.count() > 0:
 
@@ -701,11 +696,13 @@ def _candidate_panels(page):
                         timeout=1000
                     )
 
+                    lower_txt = txt.lower()
+
                     if (
                         "station index"
-                        in txt.lower()
+                        in lower_txt
                         and "view"
-                        in txt.lower()
+                        in lower_txt
                     ):
 
                         result.append(
@@ -733,6 +730,7 @@ def find_station_panel(page):
 
         return None
 
+    # Prefer the smallest matching visible panel.
     ranked = sorted(
         panels,
         key=lambda p: len(
@@ -750,10 +748,13 @@ def find_station_panel(page):
 def set_period_to_daily_in_panel(
     panel
 ):
-
     """
     Select Daily in the Period dropdown.
     """
+
+    print(
+        "   selecting Period: Daily..."
+    )
 
     selects = panel.locator(
         "select"
@@ -774,14 +775,25 @@ def set_period_to_daily_in_panel(
                 ).all_inner_texts()
             ]
 
-            if any(
-                o.lower() == "daily"
-                for o in opts
-            ):
+            daily_option = None
+
+            for option in opts:
+
+                if option.lower() == "daily":
+
+                    daily_option = option
+
+                    break
+
+            if daily_option:
 
                 sel.select_option(
-                    label="Daily",
-                    timeout=2000,
+                    label=daily_option,
+                    timeout=3000,
+                )
+
+                print(
+                    "   Daily selected."
                 )
 
                 return True
@@ -789,6 +801,10 @@ def set_period_to_daily_in_panel(
         except Exception:
 
             continue
+
+    print(
+        "   Could not find Daily option."
+    )
 
     return False
 
@@ -801,18 +817,32 @@ def click_view_in_panel(
     panel
 ):
 
+    print(
+        "   clicking VIEW..."
+    )
+
     for selector in [
-        "text=VIEW",
         "button:has-text('VIEW')",
         "input[value='VIEW']",
+        "text=VIEW",
     ]:
 
         try:
 
-            panel.locator(
+            button = panel.locator(
                 selector
-            ).first.click(
-                timeout=3000
+            ).first
+
+            if not button.is_visible():
+
+                continue
+
+            button.click(
+                timeout=5000
+            )
+
+            print(
+                "   VIEW clicked."
             )
 
             return True
@@ -820,6 +850,10 @@ def click_view_in_panel(
         except Exception:
 
             continue
+
+    print(
+        "   Could not find/click VIEW."
+    )
 
     return False
 
@@ -831,8 +865,9 @@ def click_view_in_panel(
 def table_rows_from_panel(
     panel
 ):
-
     """
+    Read the DHM rainfall table.
+
     Returns:
 
         [
@@ -841,83 +876,240 @@ def table_rows_from_panel(
         ]
 
     Running Total is intentionally ignored.
+
+    The parser searches each row for a date instead of assuming
+    that the date is always the first cell.
     """
 
     rows_data = []
 
     try:
 
-        rows = panel.locator(
-            "table tr"
+        tables = panel.locator(
+            "table"
         )
 
-        count = rows.count()
+        table_count = tables.count()
 
-    except Exception:
+        print(
+            f"   Found {table_count} table(s) "
+            f"inside station panel."
+        )
+
+    except Exception as e:
+
+        print(
+            f"   Could not locate tables: {e}"
+        )
 
         return rows_data
 
-    for i in range(
-        count
+    # --------------------------------------------------------
+    # Examine every table
+    # --------------------------------------------------------
+
+    for table_index in range(
+        table_count
     ):
 
         try:
 
-            cells = rows.nth(i).locator(
-                "td, th"
+            table = tables.nth(
+                table_index
             )
 
-            texts = [
-                cells.nth(j).inner_text().strip()
-                for j in range(
-                    cells.count()
-                )
-            ]
+            rows = table.locator(
+                "tr"
+            )
+
+            row_count = rows.count()
+
+            print(
+                f"   Table {table_index + 1}: "
+                f"{row_count} row(s)"
+            )
 
         except Exception:
 
             continue
 
-        if len(texts) < 2:
-
-            continue
-
         # ----------------------------------------------------
-        # Find date
+        # Examine every row
         # ----------------------------------------------------
 
-        date_str = None
+        for row_index in range(
+            row_count
+        ):
 
-        for pattern in DATE_PATTERNS:
+            try:
 
-            m = re.search(
-                pattern,
-                texts[0],
+                row = rows.nth(
+                    row_index
+                )
+
+                cells = row.locator(
+                    "td, th"
+                )
+
+                cell_count = cells.count()
+
+                texts = []
+
+                for cell_index in range(
+                    cell_count
+                ):
+
+                    try:
+
+                        text = (
+                            cells.nth(
+                                cell_index
+                            )
+                            .inner_text()
+                            .strip()
+                        )
+
+                    except Exception:
+
+                        text = ""
+
+                    texts.append(
+                        text
+                    )
+
+            except Exception:
+
+                continue
+
+            if not texts:
+
+                continue
+
+            # ------------------------------------------------
+            # Print first few rows for debugging
+            # ------------------------------------------------
+
+            if row_index < 5:
+
+                print(
+                    f"      row {row_index}: "
+                    f"{texts}"
+                )
+
+            # ------------------------------------------------
+            # Skip obvious header rows
+            # ------------------------------------------------
+
+            joined = " | ".join(
+                texts
             )
 
-            if m:
+            lower_joined = joined.lower()
 
-                date_str = parse_date_token(
-                    m.group(0)
+            if (
+                "date" in lower_joined
+                and (
+                    "daily" in lower_joined
+                    or "rainfall" in lower_joined
                 )
+            ):
+
+                continue
+
+            # ------------------------------------------------
+            # Find date anywhere in row
+            # ------------------------------------------------
+
+            date_str = None
+            date_cell_index = None
+
+            for cell_index, cell_text in enumerate(
+                texts
+            ):
+
+                if not cell_text:
+
+                    continue
+
+                for pattern in DATE_PATTERNS:
+
+                    match = re.search(
+                        pattern,
+                        cell_text,
+                    )
+
+                    if match:
+
+                        parsed = parse_date_token(
+                            match.group(0)
+                        )
+
+                        if parsed:
+
+                            date_str = parsed
+                            date_cell_index = (
+                                cell_index
+                            )
+
+                            break
 
                 if date_str:
 
                     break
 
-        if not date_str:
+            if not date_str:
 
-            continue
+                continue
 
-        # ----------------------------------------------------
-        # Daily rainfall
-        # ----------------------------------------------------
+            # ------------------------------------------------
+            # Find rainfall value after date
+            # ------------------------------------------------
 
-        daily_val = parse_number(
-            texts[1]
-        )
+            daily_val = None
 
-        if daily_val is not None:
+            search_start = (
+                date_cell_index + 1
+                if date_cell_index is not None
+                else 1
+            )
+
+            for cell_text in texts[
+                search_start:
+            ]:
+
+                if not cell_text:
+
+                    continue
+
+                # Do not interpret another date as rainfall.
+                contains_date = False
+
+                for pattern in DATE_PATTERNS:
+
+                    if re.search(
+                        pattern,
+                        cell_text
+                    ):
+
+                        contains_date = True
+
+                        break
+
+                if contains_date:
+
+                    continue
+
+                daily_val = parse_number(
+                    cell_text
+                )
+
+                if daily_val is not None:
+
+                    break
+
+            if daily_val is None:
+
+                continue
 
             rows_data.append(
                 (
@@ -925,6 +1117,25 @@ def table_rows_from_panel(
                     daily_val,
                 )
             )
+
+    # --------------------------------------------------------
+    # Remove duplicate dates
+    # --------------------------------------------------------
+
+    unique_rows = {}
+
+    for (
+        date_str,
+        daily_val
+    ) in rows_data:
+
+        unique_rows[
+            date_str
+        ] = daily_val
+
+    rows_data = sorted(
+        unique_rows.items()
+    )
 
     return rows_data
 
@@ -990,7 +1201,6 @@ def process_station(
     station,
     debug_tag=None
 ):
-
     """
     Returns:
 
@@ -1017,6 +1227,10 @@ def process_station(
     # Open map
     # --------------------------------------------------------
 
+    print(
+        "   Opening DHM rainfall map..."
+    )
+
     page.goto(
         MAP_URL,
         wait_until="domcontentloaded",
@@ -1024,7 +1238,7 @@ def process_station(
     )
 
     page.wait_for_timeout(
-        2000
+        2500
     )
 
     # --------------------------------------------------------
@@ -1048,18 +1262,30 @@ def process_station(
         )
 
     # --------------------------------------------------------
-    # Find station panel
+    # Find station marker and click it
     # --------------------------------------------------------
 
+    print(
+        "   Looking for station marker..."
+    )
+
     panel = None
+    marker_clicked = False
 
-    for _ in range(20):
+    for attempt in range(
+        30
+    ):
 
+        # First see whether panel already exists.
         panel = find_station_panel(
             page
         )
 
         if panel is not None:
+
+            print(
+                "   Station panel found."
+            )
 
             break
 
@@ -1074,14 +1300,44 @@ def process_station(
 
             try:
 
-                markers.first.click(
-                    force=True,
-                    timeout=2000,
+                marker_count = markers.count()
+
+                print(
+                    f"   Found {marker_count} "
+                    f"map marker(s)."
                 )
 
-            except Exception:
+                # After filtering, the first visible marker
+                # should correspond to the selected station.
+                markers.first.click(
+                    force=True,
+                    timeout=3000,
+                )
 
-                pass
+                marker_clicked = True
+
+                print(
+                    "   Station marker clicked."
+                )
+
+                page.wait_for_timeout(
+                    1000
+                )
+
+            except Exception as e:
+
+                if attempt in {
+                    0,
+                    5,
+                    10,
+                    20,
+                }:
+
+                    print(
+                        f"   Marker click attempt "
+                        f"{attempt + 1} failed: "
+                        f"{e}"
+                    )
 
         time.sleep(
             0.5
@@ -1106,8 +1362,22 @@ def process_station(
                 page.screenshot(
                     path=os.path.join(
                         DEBUG_DIR,
-                        f"{safe_debug_tag}_no_panel.png",
+                        f"{safe_debug_tag}_no_panel.png"
                     )
+                )
+
+                save_debug_file(
+                    debug_tag,
+                    "_no_panel_text.txt",
+                    page.locator(
+                        "body"
+                    ).inner_text(),
+                )
+
+                save_debug_file(
+                    debug_tag,
+                    "_no_panel_html.txt",
+                    page.content(),
                 )
 
             except Exception:
@@ -1120,7 +1390,7 @@ def process_station(
         )
 
     # --------------------------------------------------------
-    # Save debug files
+    # Save panel debug files
     # --------------------------------------------------------
 
     if debug_tag:
@@ -1158,6 +1428,18 @@ def process_station(
 
             pass
 
+        try:
+
+            save_debug_file(
+                debug_tag,
+                "_panel_text.txt",
+                panel.inner_text(),
+            )
+
+        except Exception:
+
+            pass
+
     # --------------------------------------------------------
     # Select Daily
     # --------------------------------------------------------
@@ -1167,6 +1449,13 @@ def process_station(
             panel
         )
     )
+
+    if not period_ok:
+
+        print(
+            "   WARNING: Daily period could "
+            "not be selected."
+        )
 
     # --------------------------------------------------------
     # Click VIEW
@@ -1178,8 +1467,44 @@ def process_station(
         )
     )
 
+    if not view_ok:
+
+        print(
+            "   WARNING: VIEW button could "
+            "not be clicked."
+        )
+
+    # --------------------------------------------------------
+    # Wait for rainfall table
+    # --------------------------------------------------------
+
+    print(
+        "   Waiting for rainfall table..."
+    )
+
+    try:
+
+        panel.locator(
+            "table"
+        ).first.wait_for(
+            state="visible",
+            timeout=10000,
+        )
+
+        print(
+            "   Rainfall table became visible."
+        )
+
+    except Exception:
+
+        print(
+            "   Warning: rainfall table did not "
+            "become visible within 10 seconds."
+        )
+
+    # Give the DHM JavaScript time to populate rows.
     page.wait_for_timeout(
-        2000
+        3000
     )
 
     # --------------------------------------------------------
@@ -1199,10 +1524,19 @@ def process_station(
     today = nepal_today_iso()
 
     kept_rows = [
-        r
-        for r in all_rows
-        if r[0] != today
+        row
+        for row in all_rows
+        if row[0] != today
     ]
+
+    if today in {
+        row[0]
+        for row in all_rows
+    }:
+
+        print(
+            f"   Skipped today's row: {today}"
+        )
 
     # --------------------------------------------------------
     # Debug result
@@ -1214,8 +1548,10 @@ def process_station(
             debug_tag,
             "_result.txt",
             f"filtered_ok: {filtered_ok}\n"
+            f"marker_clicked: {marker_clicked}\n"
             f"period_ok: {period_ok}\n"
             f"view_ok: {view_ok}\n"
+            f"today: {today}\n"
             f"all_rows: {all_rows}\n"
             f"kept_rows: {kept_rows}\n",
         )
@@ -1239,7 +1575,6 @@ def append_all_rows(
     path,
     entries
 ):
-
     """
     Local Excel output.
 
@@ -1248,8 +1583,8 @@ def append_all_rows(
         Date
         Daily Rainfall (mm)
 
-    Existing dates are checked so that local Excel files
-    also do not accumulate duplicate rows.
+    Existing dates are checked so local Excel files also
+    do not accumulate duplicate rows.
     """
 
     existing_dates = set()
@@ -1262,7 +1597,10 @@ def append_all_rows(
 
         ws = wb.active
 
-        # Read existing dates.
+        # ----------------------------------------------------
+        # Read existing dates
+        # ----------------------------------------------------
+
         for row in ws.iter_rows(
             min_row=2,
             values_only=True
@@ -1285,7 +1623,9 @@ def append_all_rows(
 
                 date_str = (
                     value.date()
-                    .strftime("%Y-%m-%d")
+                    .strftime(
+                        "%Y-%m-%d"
+                    )
                 )
 
             elif isinstance(
@@ -1305,6 +1645,14 @@ def append_all_rows(
                     value
                 ).strip()
 
+                parsed = parse_date_token(
+                    date_str
+                )
+
+                if parsed:
+
+                    date_str = parsed
+
             existing_dates.add(
                 date_str
             )
@@ -1323,6 +1671,10 @@ def append_all_rows(
                 "Daily Rainfall (mm)",
             ]
         )
+
+    # --------------------------------------------------------
+    # Append only new dates
+    # --------------------------------------------------------
 
     added = 0
 
@@ -1360,7 +1712,6 @@ def append_all_rows(
 # ============================================================
 
 def load_google_credentials():
-
     """
     Load OAuth credentials from token.json.
 
@@ -1415,14 +1766,13 @@ def load_google_credentials():
 
 
 # ============================================================
-# GOOGLE DRIVE
+# GOOGLE DRIVE FOLDER
 # ============================================================
 
 def get_google_drive_folder(
     drive,
     folder_name
 ):
-
     """
     Find the existing DHM Rainfall folder.
 
@@ -1434,8 +1784,15 @@ def get_google_drive_folder(
         f"{folder_name}"
     )
 
+    escaped_name = (
+        folder_name.replace(
+            "'",
+            "\\'"
+        )
+    )
+
     query = (
-        f"name = '{folder_name}' "
+        f"name = '{escaped_name}' "
         f"and mimeType = "
         f"'application/vnd.google-apps.folder' "
         f"and trashed = false"
@@ -1482,10 +1839,11 @@ def find_station_spreadsheet(
     folder_id,
     spreadsheet_name
 ):
-
     """
     Find a station spreadsheet specifically inside
     the DHM Rainfall folder.
+
+    There are no station subfolders.
     """
 
     escaped_name = (
@@ -1506,7 +1864,7 @@ def find_station_spreadsheet(
     results = drive.files().list(
         q=query,
         pageSize=10,
-        fields="files(id,name)"
+        fields="files(id,name,parents)"
     ).execute()
 
     files = results.get(
@@ -1531,10 +1889,9 @@ def create_station_spreadsheet(
     folder_id,
     spreadsheet_name
 ):
-
     """
     Create a new Google Spreadsheet for one station
-    and place it inside DHM Rainfall.
+    and place it directly inside DHM Rainfall.
     """
 
     print(
@@ -1567,14 +1924,20 @@ def create_station_spreadsheet(
         "spreadsheetId"
     ]
 
-    # Move spreadsheet into DHM Rainfall folder.
+    # --------------------------------------------------------
+    # Put spreadsheet directly inside DHM Rainfall.
+    # --------------------------------------------------------
+
     drive.files().update(
         fileId=spreadsheet_id,
         addParents=folder_id,
         fields="id,parents"
     ).execute()
 
-    # Add header row.
+    # --------------------------------------------------------
+    # Add header
+    # --------------------------------------------------------
+
     sheets.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"{GOOGLE_SHEET_TAB}!A1:B1",
@@ -1590,7 +1953,7 @@ def create_station_spreadsheet(
     ).execute()
 
     print(
-        f"   Google Spreadsheet created."
+        "   Google Spreadsheet created."
     )
 
     print(
@@ -1682,11 +2045,10 @@ def get_existing_google_dates(
     sheets,
     spreadsheet_id
 ):
-
     """
     Read column A from the station spreadsheet.
 
-    Returns a set such as:
+    Returns dates such as:
 
         {
             "2026-09-24",
@@ -1730,7 +2092,6 @@ def get_existing_google_dates(
 
             continue
 
-        # Normalize possible date formats.
         parsed = parse_date_token(
             value
         )
@@ -1743,7 +2104,6 @@ def get_existing_google_dates(
 
         else:
 
-            # Keep original if already ISO.
             existing_dates.add(
                 value
             )
@@ -1760,13 +2120,10 @@ def append_new_google_rows(
     spreadsheet_id,
     entries
 ):
-
     """
-    Add only dates that are not already in the station
-    spreadsheet.
+    Add only dates that are not already present.
 
     Returns:
-
         number of newly added rows
     """
 
@@ -1797,6 +2154,12 @@ def append_new_google_rows(
                 date_str,
                 daily_val,
             ]
+        )
+
+        # Also update in-memory set in case entries
+        # itself contains duplicate dates.
+        existing_dates.add(
+            date_str
         )
 
     if not new_rows:
@@ -1834,7 +2197,6 @@ def save_station_to_google(
     station,
     history
 ):
-
     """
     Create/find the station's individual Google Spreadsheet
     and add only new dates.
@@ -1985,6 +2347,11 @@ def main():
         .strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+    )
+
+    print(
+        f"Run timestamp UTC: "
+        f"{run_timestamp}"
     )
 
     # --------------------------------------------------------
