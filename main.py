@@ -398,132 +398,151 @@ def visible_popup(page):
 # STATION NAME
 # ============================================================
 
-def station_name_from_popup(
-    popup,
-    sequence,
-):
+def station_info_from_popup(popup, sequence):
     """
-    Extract station name from the popup.
-    """
+    Extract the actual DHM station name and station index/code
+    from the Leaflet popup.
 
+    Example popup:
+        Station: Thakmarpha | District: MUSTANG
+        Station Index: 0604
+        Latitude: 28.740909, Longitude: 83.7
+    """
     try:
-
         text = popup.inner_text()
-
     except Exception:
-
-        return (
-            f"Station_{sequence:04d}"
-        )
+        text = ""
 
     lines = [
-        re.sub(
-            r"\s+",
-            " ",
-            x,
-        ).strip()
-
+        re.sub(r"\s+", " ", x).strip()
         for x in text.splitlines()
-
         if x.strip()
     ]
 
-    # --------------------------------------------------------
-    # Look for:
-    #
-    # Station Name: ABC
-    # Station: ABC
-    # Name: ABC
-    # --------------------------------------------------------
+    station_name = None
+    station_index = None
 
-    label_pattern = re.compile(
-        r"^(?:station\s*name|station|name)"
-        r"\s*[:\-]\s*(.+)$",
-        re.I,
-    )
+    # --------------------------------------------------------
+    # Actual station index/code.
+    # Keep leading zeroes, e.g. 0604.
+    # --------------------------------------------------------
+    index_patterns = [
+        r"\bstation\s*index\s*(?:code|number|no\.?)?\s*[:\-]\s*([A-Za-z0-9_-]+)",
+        r"\bstation\s*(?:index|number|no\.?)\s*[:\-]\s*([A-Za-z0-9_-]+)",
+    ]
 
     for line in lines:
+        for pattern in index_patterns:
+            m = re.search(pattern, line, re.I)
+            if m:
+                station_index = m.group(1).strip()
+                break
+        if station_index:
+            break
 
-        match = label_pattern.match(
-            line
-        )
+    # --------------------------------------------------------
+    # Station name.
+    # Handles:
+    #   Station: Thakmarpha | District: MUSTANG
+    #   Station Name: ABC
+    #   Station: ABC
+    # --------------------------------------------------------
+    station_patterns = [
+        r"^(?:station\s*name|station|name)\s*[:\-]\s*(.+)$",
+    ]
 
-        if match:
+    for line in lines:
+        for pattern in station_patterns:
+            m = re.match(pattern, line, re.I)
+            if not m:
+                continue
 
-            value = (
-                match.group(1)
-                .strip()
-            )
+            value = m.group(1).strip()
+
+            # The DHM popup may put District on the same line.
+            value = re.split(
+                r"\s*\|\s*(?:district|province|basin|river)\s*[:\-]",
+                value,
+                maxsplit=1,
+                flags=re.I,
+            )[0].strip()
 
             if value:
-                return value[:180]
+                station_name = value[:180]
+                break
+
+        if station_name:
+            break
 
     # --------------------------------------------------------
-    # Sometimes label and value are separate:
-    #
-    # Station Name
-    # ABC
+    # Sometimes the label and value are separate.
     # --------------------------------------------------------
-
-    for i, line in enumerate(
-        lines[:-1]
-    ):
-
-        if re.fullmatch(
-            r"(?:station\s*name|station|name)",
-            line,
-            re.I,
-        ):
-
-            candidate = (
-                lines[i + 1]
-                .strip()
-            )
-
-            if (
-                candidate
-                and not re.search(
-                    r"rainfall|daily|total|date|period|view",
-                    candidate,
-                    re.I,
-                )
+    if not station_name:
+        for i, line in enumerate(lines[:-1]):
+            if re.fullmatch(
+                r"(?:station\s*name|station|name)",
+                line,
+                re.I,
             ):
+                candidate = lines[i + 1].strip()
+                candidate = re.split(
+                    r"\s*\|\s*(?:district|province|basin|river)\s*[:\-]",
+                    candidate,
+                    maxsplit=1,
+                    flags=re.I,
+                )[0].strip()
 
-                return candidate[:180]
+                if (
+                    candidate
+                    and not re.search(
+                        r"rainfall|daily|total|date|period|view|station index|latitude|longitude",
+                        candidate,
+                        re.I,
+                    )
+                ):
+                    station_name = candidate[:180]
+                    break
 
     # --------------------------------------------------------
-    # Fallback: first useful non-numeric line.
+    # Final station-name fallback.
     # --------------------------------------------------------
+    if not station_name:
+        ignored = {
+            "VIEW", "View", "DAILY", "Daily", "Date", "Period",
+            "Rainfall", "Accumulated Rainfall", "24 Hour",
+        }
 
-    ignored = {
-        "VIEW",
-        "View",
-        "DAILY",
-        "Daily",
-        "Date",
-        "Period",
-        "Rainfall",
-        "Accumulated Rainfall",
-        "24 Hour",
-    }
+        for line in lines:
+            if line in ignored:
+                continue
+            if re.fullmatch(r"[\d.,\-\s]+", line):
+                continue
+            if re.search(
+                r"station\s*index|latitude|longitude|district|province",
+                line,
+                re.I,
+            ):
+                continue
+            if len(line) >= 2:
+                station_name = line[:180]
+                break
 
-    for line in lines:
+    if not station_name:
+        station_name = f"Station_{sequence:04d}"
 
-        if line in ignored:
-            continue
+    if not station_index:
+        raise RuntimeError(
+            "Could not extract the actual Station Index/code "
+            f"from the popup for station sequence {sequence}."
+        )
 
-        if re.fullmatch(
-            r"[\d.,\-\s]+",
-            line,
-        ):
-            continue
+    return station_name, station_index
 
-        if len(line) >= 2:
-            return line[:180]
 
-    return (
-        f"Station_{sequence:04d}"
-    )
+def station_name_from_popup(popup, sequence):
+    """Backward-compatible station-name helper."""
+    name, _ = station_info_from_popup(popup, sequence)
+    return name
 
 
 # ============================================================
@@ -1720,176 +1739,75 @@ def set_page_date(page, target_date):
 
     return False
 
-def extract_popup_rainfall(
-    popup,
-    page,
-):
+def extract_popup_rainfall(popup, page):
     """
-    Extract ONLY yesterday's rainfall.
+    Extract every Daily rainfall row returned by DHM except today's row.
 
-    Primary workflow:
-        1. Leave DHM Date unchanged.
+    Required workflow:
+        1. Leave DHM's Date field unchanged.
         2. Set Period = Daily.
         3. Click VIEW.
-        4. Read the returned table.
-        5. If yesterday is already present, use it.
+        4. Read the page-level Date | Daily | Total table.
+        5. Exclude today's date.
+        6. Return all remaining rows for Excel.
 
-    Fallback workflow:
-        If DHM returned Daily data only for its currently selected
-        Date, set the page Date to yesterday, click VIEW again, and
-        read the Daily result.
-
-    This fallback is necessary because DHM's Date field acts as a
-    query/filter date; a Daily query for today's date does not
-    necessarily return yesterday's row.
+    No Date-field fallback is used. The user's requirement is to use
+    the table produced by the normal Daily + VIEW workflow and simply
+    remove today's row.
     """
+    today = dt.date.today().strftime("%Y-%m-%d")
 
-    target_date = yesterday_iso()
+    print(f"    Today's AD date (will be excluded): {today}")
 
-    print(
-        f"    Target AD date: {target_date}"
-    )
-
-    # ============================================================
+    # ------------------------------------------------------------
     # STEP 1: Period = Daily
-    # ============================================================
-
-    if not set_popup_period_daily(
-        popup,
-        page,
-    ):
+    # ------------------------------------------------------------
+    if not set_popup_period_daily(popup, page):
         raise RuntimeError(
-            "Period dropdown was not found "
-            "or could not be set to Daily."
+            "Period dropdown was not found or could not be set to Daily."
         )
 
-    # ============================================================
+    # ------------------------------------------------------------
     # STEP 2: VIEW
-    # ============================================================
-
-    if not click_popup_view(
-        popup,
-        page,
-    ):
+    # ------------------------------------------------------------
+    if not click_popup_view(popup, page):
         raise RuntimeError(
-            "VIEW button was not found "
-            "on the station page."
+            "VIEW button was not found on the station page."
         )
 
-    # ============================================================
+    # ------------------------------------------------------------
     # STEP 3: Wait for the Daily table.
-    # ============================================================
-
-    print(
-        "    Waiting for Daily rainfall table..."
-    )
+    # ------------------------------------------------------------
+    print("    Waiting for Daily rainfall table...")
 
     for _ in range(30):
-
-        rows = read_rainfall_table_from_popup(
-            popup,
-            page,
-        )
+        rows = read_rainfall_table_from_popup(popup, page)
 
         if rows:
             print(
-                f"    Daily table returned "
-                f"{len(rows)} row(s)."
+                f"    Daily table returned {len(rows)} row(s) "
+                "before today's-row filtering."
             )
 
-            yesterday_rows = [
-                row
-                for row in rows
-                if row[0] == target_date
+            # Exclude today's row, retain every other returned date.
+            filtered = [
+                row for row in rows
+                if row[0] != today
             ]
 
-            if yesterday_rows:
-                print(
-                    f"    Found yesterday "
-                    f"({target_date}) in returned table."
-                )
-                return yesterday_rows
+            print(
+                f"    Excluded today's row ({today}); "
+                f"{len(filtered)} historical row(s) remain."
+            )
 
-        page.wait_for_timeout(500)
-
-    # ============================================================
-    # STEP 4: FALLBACK
-    #
-    # If today's Date query did not include yesterday, explicitly
-    # query DHM for yesterday.
-    # ============================================================
-
-    print(
-        f"    Yesterday ({target_date}) was not present "
-        "in the first Daily result."
-    )
-
-    print(
-        f"    Setting DHM Date to {target_date} "
-        "and requesting Daily data again..."
-    )
-
-    if not set_page_date(
-        page,
-        target_date,
-    ):
-        raise RuntimeError(
-            "Yesterday was not present in the Daily table, "
-            "and the DHM Date input could not be set to "
-            f"{target_date}."
-        )
-
-    # Re-apply Daily because DHM may rebuild the controls/table
-    # after the Date field changes.
-    if not set_popup_period_daily(
-        popup,
-        page,
-    ):
-        raise RuntimeError(
-            "Period could not be reset to Daily "
-            "after changing the Date."
-        )
-
-    if not click_popup_view(
-        popup,
-        page,
-    ):
-        raise RuntimeError(
-            "VIEW button could not be clicked "
-            "after changing the Date."
-        )
-
-    # ============================================================
-    # STEP 5: Read the second result.
-    # ============================================================
-
-    for _ in range(30):
-
-        rows = read_rainfall_table_from_popup(
-            popup,
-            page,
-        )
-
-        if rows:
-            yesterday_rows = [
-                row
-                for row in rows
-                if row[0] == target_date
-            ]
-
-            if yesterday_rows:
-                print(
-                    f"    Found yesterday "
-                    f"({target_date}) after Date fallback."
-                )
-                return yesterday_rows
+            if filtered:
+                return filtered
 
         page.wait_for_timeout(500)
 
     raise RuntimeError(
-        "Daily rainfall table loaded, but no row was found "
-        f"for yesterday ({target_date}) even after querying "
-        "DHM with yesterday's Date."
+        "Daily rainfall table did not return any historical row "
+        f"after excluding today's date ({today})."
     )
 
 
@@ -1904,14 +1822,15 @@ def safe_filename(
     """
     Create:
 
-        stationindex_StationName.xlsx
+        actual_DHM_station_index_StationName.xlsx
 
     Examples:
 
-        1_Tarakhola.xlsx
-        2_Panchase.xlsx
-        365_Tarakhola.xlsx
-        366_Panchase.xlsx
+        0604_Thakmarpha.xlsx
+        0123_Tarakhola.xlsx
+
+    The actual DHM Station Index/code is used, not the marker
+    sequence number.
     """
 
     clean = re.sub(
@@ -2225,8 +2144,8 @@ def process_marker(
     # Station name.
     # --------------------------------------------------------
 
-    station_name = (
-        station_name_from_popup(
+    station_name, actual_station_index = (
+        station_info_from_popup(
             popup,
             sequence,
         )
@@ -2240,7 +2159,11 @@ def process_marker(
         )
 
     print(
-        f"    station index: {sequence}"
+        f"    station sequence: {sequence}"
+    )
+
+    print(
+        f"    actual Station Index: {actual_station_index}"
     )
 
     print(
@@ -2275,6 +2198,7 @@ def process_marker(
 
     return (
         station_name,
+        actual_station_index,
         rows,
     )
 
@@ -2322,6 +2246,11 @@ def main():
 
     print(
         "Period will be set to Daily."
+    )
+
+    print(
+        "Today's row will be excluded; all other returned Daily rows "
+        "will be saved."
     )
 
     print(
@@ -2406,15 +2335,21 @@ def main():
             # HOW MANY STATIONS?
             # =================================================
 
-            if MAX_STATIONS:
+            if DEBUG:
+                # Debug runs are always limited to the first 10 stations.
+                DEBUG_MAX_STATIONS = 10
+                total_to_process = min(
+                    total,
+                    DEBUG_MAX_STATIONS,
+                )
 
+            elif MAX_STATIONS:
                 total_to_process = min(
                     total,
                     MAX_STATIONS,
                 )
 
             else:
-
                 total_to_process = total
 
             print(
@@ -2446,7 +2381,7 @@ def main():
 
                 print(
                     f"[{sequence}/{total_to_process}] "
-                    f"Station index {sequence}"
+                    f"Station marker sequence {sequence}"
                 )
 
                 print(
@@ -2501,7 +2436,7 @@ def main():
                         )
                     )
 
-                    station_name, rows = (
+                    station_name, actual_station_index, rows = (
                         process_marker(
                             page,
                             marker,
@@ -2515,7 +2450,7 @@ def main():
 
                     filename = (
                         safe_filename(
-                            sequence,
+                            actual_station_index,
                             station_name,
                         )
                     )
