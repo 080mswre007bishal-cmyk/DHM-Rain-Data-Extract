@@ -2,45 +2,44 @@
 main.py
 -------
 For every station in stations.json:
-  1. Open its DHM page in a headless browser.
-  2. Select the "Daily" period and click VIEW. On the pages I could
-     confirm (dhm.gov.np/hydrology/rainfallSingle/<id>), this reveals
-     an "Accumulated Rainfall" table -- the same widget you found on
-     the rainfall-watch-map page. This is loaded by JavaScript, so a
-     real browser is used instead of a plain HTTP request.
-  3. Read every (date, value) pair that appears -- normally the last
-     8 days.
-  4. For each station's output/<station>.xlsx, skip any date already
+  1. Open its DHM page in a headless browser
+     (dhm.gov.np/hydrology/rainfallSingle/<id> -- confirmed to carry the
+     same "Date / Period / VIEW / Accumulated Rainfall" widget as the
+     rainfall-watch-map page, via a screenshot you shared).
+  2. Set the Date field to YESTERDAY (Nepal time), because today's
+     figure is still updating throughout the day.
+  3. Set Period to "Daily" and click VIEW. This reveals a table with
+     three columns: Date, Daily (mm), Total (mm) -- Total is just the
+     running sum of Daily across the visible rows.
+  4. Read every row of that table.
+  5. For each station's output/<station>.xlsx, skip any date already
      recorded and append only the new ones. Running this twice, or
      missing a scheduled run, does not create duplicates and
-     self-heals small gaps because each run re-reads the last 8 days.
-  5. If any new rows were added, upload/update that file in a Google
-     Drive folder.
+     self-heals small gaps, since each run re-reads the whole visible
+     window (usually the last 8 days).
 
-IMPORTANT -- please read before relying on this in production:
-I confirmed the STATIC HTML of the DHM station pages by fetching them
-directly (the "Period: Point / Hourly / Daily / Point for 7 days" and
-"VIEW" / "Accumulated Rainfall" labels are really there). What I could
-NOT confirm is exactly how the 8-day table is laid out in the page
-text right after you click VIEW -- my environment can't reach
-dhm.gov.np or run a real browser against it, so I never got to see
-that table's actual text. extract_rainfall_history() below is a
-best-effort, generic parser: it snapshots the page text before/after
-clicking, looks for date-shaped tokens in the new text, and pairs each
-one with the nearest plausible number (0-999). It is very likely to
-need a tweak.
+Google Drive upload is DISABLED for now, per your request -- focus is
+on getting the extraction right first. The functions are still here,
+commented out of the main loop, so it's a one-line change to turn
+back on later. In the meantime, output/*.xlsx is picked up by the
+"Upload run artifacts" step already in rainfall.yml, so you can
+download it from the Actions run summary page after every run.
 
-Run with DEBUG_STATIONS=3 first (see bottom of file). It saves a
-screenshot AND the full before/after page text to output/debug/ for
-each station -- open the .txt file, find the real table text, and
-check whether the (date, value) pairs printed in the log actually
-match. If not, adjust extract_rainfall_history() below using that
-saved text as your reference. That's the one function you should
-expect to tune; the Excel/dedup/Drive-upload logic under it doesn't
-depend on getting the parsing exactly right on the first try.
+IMPORTANT -- what's confirmed vs. not:
+CONFIRMED (from your screenshot): the table's three columns and their
+date format ("Fri, Sep 25, 2026, 12:00 AM"), and that Period is a
+plain dropdown already showing "Daily". table_rows_from_page() below
+extracts rows using that exact structure.
+NOT CONFIRMED: the exact HTML element used for the Date input (I can't
+load a real browser against dhm.gov.np myself), so set_date_to()
+tries a few likely selectors. If none of them work, the code falls
+back to whatever date range shows up by default and you'll see that
+clearly in the debug artifacts -- run DEBUG_STATIONS=3 first and check
+output/debug/*.txt to confirm the Date field actually landed on
+yesterday's date before trusting a live run.
 
 Usage:
-    pip install playwright openpyxl google-api-python-client google-auth
+    pip install playwright openpyxl
     playwright install chromium
     python main.py
 """
@@ -62,23 +61,23 @@ STATION_URL = "https://dhm.gov.np/hydrology/rainfallSingle/{}"
 # Set via env var for a quick test, e.g. DEBUG_STATIONS=3 python main.py
 DEBUG_STATIONS = int(os.environ.get("DEBUG_STATIONS", "0"))
 
-# How many days back the DHM "Daily" + VIEW table is expected to show.
-# You said 8 -- adjust here if the debug output shows a different count.
-HISTORY_DAYS = 8
+# Nepal is UTC+5:45.
+NEPAL_OFFSET = datetime.timedelta(hours=5, minutes=45)
 
-# Date formats DHM might use in the table (tried in this order). The
-# site's own header shows dates like "10 Jun, 2026", so that's first.
-DATE_PATTERNS = [
-    r"\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}",   # 10 Jun, 2026 / 10 June 2026
-    r"\d{4}-\d{2}-\d{2}",                    # 2026-06-10
-    r"\d{1,2}/\d{1,2}/\d{4}",                # 10/06/2026
-    r"\d{1,2}-\d{1,2}-\d{4}",                # 10-06-2026
-]
+# Date formats confirmed / guessed for parsing table cells and the top
+# Date field. Confirmed format is first.
 DATE_FORMATS = [
+    "%a, %b %d, %Y, %I:%M %p",   # Fri, Sep 25, 2026, 12:00 AM  (confirmed)
+    "%Y-%m-%d",                   # 2026-09-25
     "%d %b, %Y", "%d %B, %Y", "%d %b %Y", "%d %B %Y",
-    "%Y-%m-%d",
-    "%d/%m/%Y", "%m/%d/%Y",
-    "%d-%m-%Y",
+    "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+]
+DATE_PATTERNS = [
+    r"[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}(?:,\s+\d{1,2}:\d{2}\s*[AP]M)?",
+    r"\d{4}-\d{2}-\d{2}",
+    r"\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}",
+    r"\d{1,2}/\d{1,2}/\d{4}",
+    r"\d{1,2}-\d{1,2}-\d{4}",
 ]
 
 
@@ -86,6 +85,12 @@ def safe_filename(name, station_index, url_id):
     base = station_index or url_id
     clean_name = re.sub(r"[^\w\-]+", "_", name).strip("_")
     return f"{base}_{clean_name}.xlsx"
+
+
+def nepal_yesterday_iso():
+    now_npt = datetime.datetime.utcnow() + NEPAL_OFFSET
+    yesterday = now_npt.date() - datetime.timedelta(days=1)
+    return yesterday.strftime("%Y-%m-%d")
 
 
 def parse_date_token(token):
@@ -98,34 +103,95 @@ def parse_date_token(token):
     return None
 
 
-def find_date_and_rest(line):
-    """Find the first date-shaped token in `line`. Returns
-    (normalized_date_str, line_with_date_removed) or (None, None)."""
-    for pattern in DATE_PATTERNS:
-        m = re.search(pattern, line)
-        if m:
-            parsed = parse_date_token(m.group(0))
-            if parsed:
-                rest = line[:m.start()] + line[m.end():]
-                return parsed, rest
-    return None, None
+def parse_number(text):
+    matches = re.findall(r"\d+\.\d+|\d+", text)
+    if not matches:
+        return None
+    val = float(matches[0])
+    return val if 0 <= val < 1000 else None
+
+
+def set_date_to(page, date_iso):
+    """Best-effort: point the Date field at date_iso (YYYY-MM-DD).
+    Exact selector unconfirmed -- tries a few likely candidates."""
+    selectors = [
+        "input[type='date']",
+        "input[placeholder*='Date' i]",
+        "form input:nth-of-type(1)",
+        "input.form-control",
+    ]
+    for selector in selectors:
+        try:
+            page.fill(selector, date_iso, timeout=2000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def set_period_to_daily(page):
+    """Best-effort: select 'Daily' in the Period dropdown."""
+    try:
+        page.select_option("select", label="Daily", timeout=2000)
+        return True
+    except Exception:
+        pass
+    for selector in ["text=Daily", "label:has-text('Daily')", "[value='daily']"]:
+        try:
+            page.click(selector, timeout=2000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def table_rows_from_page(page):
+    """Read the Accumulated Rainfall table: Date | Daily | Total.
+    Returns a list of (date_str, daily_value, total_value)."""
+    rows_data = []
+    try:
+        rows = page.query_selector_all("table tr")
+    except Exception:
+        rows = []
+
+    for row in rows:
+        try:
+            cells = row.query_selector_all("td, th")
+            texts = [c.inner_text().strip() for c in cells]
+        except Exception:
+            continue
+
+        if len(texts) < 2:
+            continue
+
+        date_str = None
+        for pattern in DATE_PATTERNS:
+            m = re.search(pattern, texts[0])
+            if m:
+                date_str = parse_date_token(m.group(0))
+                if date_str:
+                    break
+        if not date_str:
+            continue
+
+        daily_val = parse_number(texts[1]) if len(texts) > 1 else None
+        total_val = parse_number(texts[2]) if len(texts) > 2 else None
+
+        if daily_val is not None:
+            rows_data.append((date_str, daily_val, total_val))
+
+    return rows_data
 
 
 def extract_rainfall_history(page, debug_tag=None):
     """
-    Best-effort extraction of the multi-day rainfall table that appears
-    after selecting "Daily" and clicking VIEW.
-    Returns a list of (date_str, value) tuples, date_str normalized to
-    YYYY-MM-DD, newest/oldest order as found on the page.
+    Sets Date to yesterday (Nepal time), Period to Daily, clicks VIEW,
+    and reads the resulting table.
+    Returns a list of (date_str, daily_value, total_value) tuples.
     """
-    before = page.inner_text("body")
-
-    for selector in ["text=Daily", "label:has-text('Daily')", "[value='daily']"]:
-        try:
-            page.click(selector, timeout=2000)
-            break
-        except Exception:
-            continue
+    target_date = nepal_yesterday_iso()
+    date_set_ok = set_date_to(page, target_date)
+    period_set_ok = set_period_to_daily(page)
 
     for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
         try:
@@ -135,48 +201,28 @@ def extract_rainfall_history(page, debug_tag=None):
             continue
 
     try:
+        page.wait_for_selector("text=Accumulated Rainfall", timeout=8000)
+    except Exception:
+        pass
+    try:
         page.wait_for_load_state("networkidle", timeout=8000)
     except Exception:
         page.wait_for_timeout(3000)
 
-    after = page.inner_text("body")
+    rows_data = table_rows_from_page(page)
 
     if debug_tag:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}.png"))
         with open(os.path.join(DEBUG_DIR, f"{debug_tag}.txt"), "w", encoding="utf-8") as f:
-            f.write("=== BEFORE ===\n" + before + "\n\n=== AFTER ===\n" + after)
+            f.write(f"target_date (Nepal, yesterday): {target_date}\n")
+            f.write(f"date_set_ok: {date_set_ok}\n")
+            f.write(f"period_set_ok: {period_set_ok}\n")
+            f.write(f"rows_extracted: {rows_data}\n\n")
+            f.write("=== FULL PAGE TEXT AFTER VIEW ===\n")
+            f.write(page.inner_text("body"))
 
-    before_lines = set(l.strip() for l in before.split("\n") if l.strip())
-    after_lines = [l.strip() for l in after.split("\n") if l.strip()]
-    new_lines = [l for l in after_lines if l not in before_lines]
-
-    entries = []
-    seen_dates = set()
-    for i, line in enumerate(new_lines):
-        date_str, rest = find_date_and_rest(line)
-        if not date_str or date_str in seen_dates:
-            continue
-
-        # Look for the rainfall number on the same line (after removing
-        # the date itself) first, then the next couple of lines -- the
-        # exact layout (same row vs. next row) isn't confirmed, see the
-        # module docstring.
-        value = None
-        for text in [rest] + new_lines[i + 1:i + 3]:
-            for match in re.findall(r"\d+\.\d+|\d+", text):
-                val = float(match)
-                if 0 <= val < 1000:
-                    value = val
-                    break
-            if value is not None:
-                break
-
-        if value is not None:
-            entries.append((date_str, value))
-            seen_dates.add(date_str)
-
-    return entries[:HISTORY_DAYS]
+    return rows_data
 
 
 def get_existing_dates(path):
@@ -192,56 +238,20 @@ def get_existing_dates(path):
 
 
 def append_new_rows(path, new_entries, run_timestamp):
-    """new_entries: list of (date_str, value) tuples NOT already in the
-    file. Appends one row per entry and saves."""
+    """new_entries: list of (date_str, daily_value, total_value) tuples
+    NOT already in the file. Appends one row per entry and saves."""
     if os.path.exists(path):
         wb = load_workbook(path)
         ws = wb.active
     else:
         wb = Workbook()
         ws = wb.active
-        ws.append(["Date", "Rainfall (mm)", "First recorded (UTC)"])
+        ws.append(["Date", "Daily Rainfall (mm)", "Running Total on page (mm)", "First recorded (UTC)"])
 
-    for date_str, value in sorted(new_entries):
-        ws.append([date_str, value, run_timestamp])
+    for date_str, daily_val, total_val in sorted(new_entries):
+        ws.append([date_str, daily_val, total_val, run_timestamp])
 
     wb.save(path)
-
-
-def get_drive_service():
-    """Build a Google Drive API client from a service account.
-    Expects GOOGLE_SERVICE_ACCOUNT_JSON env var to contain the *contents*
-    of the service account JSON key (not a file path) -- this is how the
-    GitHub Actions workflow supplies it from a secret.
-    """
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    creds_dict = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
-
-
-def upload_to_drive(service, folder_id, filepath, filename):
-    from googleapiclient.http import MediaFileUpload
-
-    query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
-    results = service.files().list(q=query, fields="files(id)").execute()
-    files = results.get("files", [])
-
-    media = MediaFileUpload(
-        filepath,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    if files:
-        service.files().update(fileId=files[0]["id"], media_body=media).execute()
-    else:
-        metadata = {"name": filename, "parents": [folder_id]}
-        service.files().create(body=metadata, media_body=media, fields="id").execute()
 
 
 def main():
@@ -254,18 +264,13 @@ def main():
         stations = stations[:DEBUG_STATIONS]
         print(f"DEBUG MODE: running only {len(stations)} station(s)")
 
-    drive_service = None
-    folder_id = os.environ.get("DRIVE_FOLDER_ID")
-    if not DEBUG_STATIONS and "GOOGLE_SERVICE_ACCOUNT_JSON" in os.environ and folder_id:
-        drive_service = get_drive_service()
-
     run_timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     with sync_playwright() as p:
         # Always headless: this runs on GitHub's servers, which have no
         # display. Debug mode still works -- it saves a screenshot and
-        # the before/after page text to output/debug/ so you can inspect
-        # the result afterward instead of watching a live browser window.
+        # the page text/state to output/debug/ so you can inspect the
+        # result afterward instead of watching a live browser window.
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
@@ -279,29 +284,30 @@ def main():
 
             try:
                 page.goto(STATION_URL.format(url_id), timeout=20000)
-                safe_name = re.sub(r"[^\w-]+", "_", name)
-                debug_tag = f"{url_id}_{safe_name}" if DEBUG_STATIONS else None
+                debug_tag = None
+                if DEBUG_STATIONS:
+                    clean_name_for_tag = re.sub(r"[^\w-]+", "_", name)
+                    debug_tag = f"{url_id}_{clean_name_for_tag}"
                 history = extract_rainfall_history(page, debug_tag=debug_tag)
             except Exception as e:
                 print(f"   failed: {e}")
                 history = []
 
-            print(f"   read {len(history)} day(s): {history}")
+            print(f"   read {len(history)} row(s): {history}")
 
             existing_dates = get_existing_dates(filepath)
-            new_entries = [(d, v) for d, v in history if d not in existing_dates]
+            new_entries = [(d, daily, total) for d, daily, total in history if d not in existing_dates]
 
             if new_entries:
                 append_new_rows(filepath, new_entries, run_timestamp)
-                print(f"   added {len(new_entries)} new day(s): {sorted(new_entries)}")
+                print(f"   added {len(new_entries)} new row(s): {sorted(new_entries)}")
             else:
-                print("   no new days to add (all already recorded, or nothing parsed)")
+                print("   no new rows to add (all already recorded, or nothing parsed)")
 
-            if drive_service and new_entries:
-                try:
-                    upload_to_drive(drive_service, folder_id, filepath, filename)
-                except Exception as e:
-                    print(f"   drive upload failed: {e}")
+            # Google Drive upload is disabled for now -- output/*.xlsx is
+            # available as a downloadable workflow artifact instead. To
+            # re-enable later, restore get_drive_service()/upload_to_drive()
+            # from the previous version and call them here.
 
             time.sleep(0.5)  # be polite to the server
 
