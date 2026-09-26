@@ -279,7 +279,8 @@ def main():
 
             try:
                 page.goto(STATION_URL.format(url_id), timeout=20000)
-                debug_tag = f"{url_id}_{re.sub(r'[^\w-]+', '_', name)}" if DEBUG_STATIONS else None
+                safe_name = re.sub(r"[^\w-]+", "_", name)
+                debug_tag = f"{url_id}_{safe_name}" if DEBUG_STATIONS else None
                 history = extract_rainfall_history(page, debug_tag=debug_tag)
             except Exception as e:
                 print(f"   failed: {e}")
