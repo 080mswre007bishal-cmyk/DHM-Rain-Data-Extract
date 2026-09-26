@@ -931,51 +931,202 @@ def set_popup_period_daily(popup, page):
 # VIEW
 # ============================================================
 
-def click_popup_view(popup):
+def click_popup_view(popup, page):
+    """
+    Click the DHM VIEW button.
 
-    candidates = [
+    IMPORTANT:
+    The screenshot/DHM layout shows that the Period control and VIEW
+    button are page-level controls associated with the station chart,
+    not necessarily children of the Leaflet popup.
 
-        popup.get_by_role(
-            "button",
-            name="VIEW",
-            exact=True,
-        ).first,
+    Therefore search:
+      1. popup
+      2. page
 
-        popup.locator(
-            "button:has-text('VIEW')"
-        ).first,
+    The page-level search is essential.
+    """
 
-        popup.locator(
-            "input[value='VIEW']"
-        ).first,
-
-        popup.locator(
-            "a:has-text('VIEW')"
-        ).first,
-
-        popup.get_by_text(
-            "VIEW",
-            exact=True,
-        ).first,
+    roots = [
+        ("popup", popup),
+        ("page", page),
     ]
 
-    for locator in candidates:
+    selectors = [
+        # Native button
+        "button",
 
-        try:
+        # Input/button variants
+        "input[type='button']",
+        "input[type='submit']",
+        "input[value='VIEW']",
 
-            locator.wait_for(
-                state="visible",
-                timeout=2000,
+        # Links
+        "a",
+
+        # Generic clickable elements
+        "[role='button']",
+        ".btn",
+        ".button",
+    ]
+
+    for label, root in roots:
+
+        for selector in selectors:
+
+            try:
+                candidates = root.locator(selector)
+
+                for i in range(candidates.count()):
+                    locator = candidates.nth(i)
+
+                    if not locator.is_visible():
+                        continue
+
+                    # Collect all useful identifying text.
+                    try:
+                        visible_text = locator.inner_text().strip()
+                    except Exception:
+                        visible_text = ""
+
+                    try:
+                        value = (
+                            locator.get_attribute("value") or ""
+                        ).strip()
+                    except Exception:
+                        value = ""
+
+                    try:
+                        aria = (
+                            locator.get_attribute("aria-label") or ""
+                        ).strip()
+                    except Exception:
+                        aria = ""
+
+                    try:
+                        title = (
+                            locator.get_attribute("title") or ""
+                        ).strip()
+                    except Exception:
+                        title = ""
+
+                    combined = " ".join(
+                        [
+                            visible_text,
+                            value,
+                            aria,
+                            title,
+                        ]
+                    ).strip()
+
+                    if combined.upper() != "VIEW":
+                        continue
+
+                    print(
+                        f"    Found VIEW button in {label}: "
+                        f"{selector} "
+                        f"text={visible_text!r} "
+                        f"value={value!r}"
+                    )
+
+                    try:
+                        locator.scroll_into_view_if_needed(
+                            timeout=3000
+                        )
+                    except Exception:
+                        pass
+
+                    # Normal click first.
+                    try:
+                        locator.click(
+                            timeout=5000
+                        )
+                    except Exception:
+                        # DHM/Bootstrap overlays can sometimes intercept
+                        # the normal click, so force it as fallback.
+                        locator.click(
+                            force=True,
+                            timeout=5000,
+                        )
+
+                    print(
+                        f"    VIEW clicked successfully in {label}."
+                    )
+
+                    # Give the DHM AJAX request a moment to start.
+                    page.wait_for_timeout(500)
+
+                    return True
+
+            except Exception:
+                continue
+
+    # ------------------------------------------------------------
+    # JavaScript fallback.
+    #
+    # This handles a custom DIV/button where Playwright's normal
+    # selector/text matching does not expose the element cleanly.
+    # ------------------------------------------------------------
+    try:
+        result = page.evaluate(
+            """
+            () => {
+                const elements = [
+                    ...document.querySelectorAll(
+                        'button, input, a, [role="button"], .btn, .button'
+                    )
+                ];
+
+                const target = elements.find(el => {
+                    if (!el || !el.offsetParent) return false;
+
+                    const text = (
+                        el.innerText ||
+                        el.value ||
+                        el.getAttribute('aria-label') ||
+                        el.getAttribute('title') ||
+                        ''
+                    ).trim().toUpperCase();
+
+                    return text === 'VIEW';
+                });
+
+                if (!target) {
+                    return {
+                        clicked: false,
+                        reason: 'VIEW element not found'
+                    };
+                }
+
+                target.scrollIntoView({
+                    block: 'center',
+                    inline: 'center'
+                });
+
+                target.click();
+
+                return {
+                    clicked: true,
+                    tag: target.tagName,
+                    text: (
+                        target.innerText ||
+                        target.value ||
+                        ''
+                    ).trim()
+                };
+            }
+            """
+        )
+
+        if result.get("clicked"):
+            print(
+                "    VIEW clicked using JavaScript fallback."
             )
-
-            locator.click(
-                force=True
-            )
-
+            page.wait_for_timeout(500)
             return True
 
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     return False
 
@@ -1126,7 +1277,8 @@ def extract_popup_rainfall(
     # --------------------------------------------------------
 
     if not click_popup_view(
-        popup
+        popup,
+        page,
     ):
 
         raise RuntimeError(
