@@ -25,18 +25,21 @@ back on later. In the meantime, output/*.xlsx is picked up by the
 "Upload run artifacts" step already in rainfall.yml, so you can
 download it from the Actions run summary page after every run.
 
-IMPORTANT -- what's confirmed vs. not:
-CONFIRMED (from your screenshot): the table's three columns and their
-date format ("Fri, Sep 25, 2026, 12:00 AM"), and that Period is a
-plain dropdown already showing "Daily". table_rows_from_page() below
-extracts rows using that exact structure.
-NOT CONFIRMED: the exact HTML element used for the Date input (I can't
-load a real browser against dhm.gov.np myself), so set_date_to()
-tries a few likely selectors. If none of them work, the code falls
-back to whatever date range shows up by default and you'll see that
-clearly in the debug artifacts -- run DEBUG_STATIONS=3 first and check
-output/debug/*.txt to confirm the Date field actually landed on
-yesterday's date before trusting a live run.
+IMPORTANT -- what's confirmed vs. not (this has already been through
+one debug round with real output, see the comments in
+set_period_to_daily() and extract_rainfall_history() below for what
+that revealed):
+CONFIRMED: the table's three columns (Date, Daily, Total) and their
+date format ("Fri, Sep 25, 2026, 12:00 AM"); that Period is a row of
+clickable tabs (Point / Hourly / Daily / Point for 7 days), NOT a
+dropdown; and that the Date field defaults to today, so today's row
+is filtered out after extraction rather than trying to set the field.
+STILL NOT FULLY CONFIRMED: whether clicking "Daily" reliably lands on
+that tab every time (vs. some other tab/label elsewhere on the page
+also matching). Run DEBUG_STATIONS=3 and check output/debug/*.txt --
+specifically the "all_rows_extracted" line and whether the real page
+text's table header reads "Date Daily Total" (correct) rather than
+"Date Point" (still wrong) -- before trusting a live run.
 
 Usage:
     pip install playwright openpyxl
@@ -87,10 +90,9 @@ def safe_filename(name, station_index, url_id):
     return f"{base}_{clean_name}.xlsx"
 
 
-def nepal_yesterday_iso():
+def nepal_today_iso():
     now_npt = datetime.datetime.utcnow() + NEPAL_OFFSET
-    yesterday = now_npt.date() - datetime.timedelta(days=1)
-    return yesterday.strftime("%Y-%m-%d")
+    return now_npt.date().strftime("%Y-%m-%d")
 
 
 def parse_date_token(token):
@@ -111,32 +113,23 @@ def parse_number(text):
     return val if 0 <= val < 1000 else None
 
 
-def set_date_to(page, date_iso):
-    """Best-effort: point the Date field at date_iso (YYYY-MM-DD).
-    Exact selector unconfirmed -- tries a few likely candidates."""
+def set_period_to_daily(page):
+    """Click the 'Daily' tab among Point / Hourly / Daily / Point for 7
+    days. CONFIRMED (from a real debug run): Period is a row of plain
+    clickable tabs, not a <select> dropdown -- an earlier version of
+    this code tried select_option() first, which silently matched some
+    unrelated hidden <select> on the page and reported false success,
+    while the page's actual Period stayed on its default, "Point" (the
+    raw 10-minute AWS feed). Exact match ("Daily") is tried first to
+    avoid accidentally matching "Point for 7 days"."""
     selectors = [
-        "input[type='date']",
-        "input[placeholder*='Date' i]",
-        "form input:nth-of-type(1)",
-        "input.form-control",
+        "text='Daily'",
+        "button:has-text('Daily')",
+        "a:has-text('Daily')",
+        "li:has-text('Daily')",
+        "label:has-text('Daily')",
     ]
     for selector in selectors:
-        try:
-            page.fill(selector, date_iso, timeout=2000)
-            return True
-        except Exception:
-            continue
-    return False
-
-
-def set_period_to_daily(page):
-    """Best-effort: select 'Daily' in the Period dropdown."""
-    try:
-        page.select_option("select", label="Daily", timeout=2000)
-        return True
-    except Exception:
-        pass
-    for selector in ["text=Daily", "label:has-text('Daily')", "[value='daily']"]:
         try:
             page.click(selector, timeout=2000)
             return True
@@ -185,12 +178,17 @@ def table_rows_from_page(page):
 
 def extract_rainfall_history(page, debug_tag=None):
     """
-    Sets Date to yesterday (Nepal time), Period to Daily, clicks VIEW,
-    and reads the resulting table.
-    Returns a list of (date_str, daily_value, total_value) tuples.
+    Clicks the "Daily" period tab and VIEW, then reads the resulting
+    table (Date | Daily | Total).
+
+    Doesn't touch the Date field: it's confirmed to default to today,
+    and rather than fight an unconfirmed date-picker element, today's
+    row (which may still be accumulating) is simply filtered out of
+    the result below instead.
+
+    Returns a list of (date_str, daily_value, total_value) tuples,
+    excluding today's row.
     """
-    target_date = nepal_yesterday_iso()
-    date_set_ok = set_date_to(page, target_date)
     period_set_ok = set_period_to_daily(page)
 
     for selector in ["text=VIEW", "button:has-text('VIEW')", "input[value='VIEW']"]:
@@ -209,20 +207,24 @@ def extract_rainfall_history(page, debug_tag=None):
     except Exception:
         page.wait_for_timeout(3000)
 
-    rows_data = table_rows_from_page(page)
+    all_rows = table_rows_from_page(page)
+    today = nepal_today_iso()
+    kept_rows = [r for r in all_rows if r[0] != today]
+    skipped_today = [r for r in all_rows if r[0] == today]
 
     if debug_tag:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         page.screenshot(path=os.path.join(DEBUG_DIR, f"{debug_tag}.png"))
         with open(os.path.join(DEBUG_DIR, f"{debug_tag}.txt"), "w", encoding="utf-8") as f:
-            f.write(f"target_date (Nepal, yesterday): {target_date}\n")
-            f.write(f"date_set_ok: {date_set_ok}\n")
-            f.write(f"period_set_ok: {period_set_ok}\n")
-            f.write(f"rows_extracted: {rows_data}\n\n")
+            f.write(f"period_set_ok (clicked 'Daily' tab): {period_set_ok}\n")
+            f.write(f"today (Nepal): {today}\n")
+            f.write(f"all_rows_extracted: {all_rows}\n")
+            f.write(f"skipped_today_row (still accumulating): {skipped_today}\n")
+            f.write(f"kept_rows (written to Excel): {kept_rows}\n\n")
             f.write("=== FULL PAGE TEXT AFTER VIEW ===\n")
             f.write(page.inner_text("body"))
 
-    return rows_data
+    return kept_rows
 
 
 def get_existing_dates(path):
