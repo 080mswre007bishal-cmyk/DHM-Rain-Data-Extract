@@ -29,6 +29,6 @@ jobs:
           printf '%s' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
           printf '%s' "$GOOGLE_TOKEN_JSON" > token.json
 
-      - name: Test Google Drive and Sheets
+      - name: Create Google Sheet
         run: |
-          python google_github_test.py
+          python create_google_sheet.py
