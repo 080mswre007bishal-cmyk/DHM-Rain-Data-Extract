@@ -1,39 +1,50 @@
+
 """
-DHM Rainfall Watch Map -> Daily station rainfall -> Excel
+DHM Rainfall Watch Map -> click each station popup -> Daily rainfall -> Excel
+
+IMPORTANT:
+The DHM map popup itself contains the station information and the rainfall
+controls. Therefore this script does NOT try to discover station IDs or
+rainfallSingle URLs.
 
 Workflow:
 1. Open https://dhm.gov.np/hydrology/rainfall-watch-map
 2. Click "24 Hour".
-3. Click the station markers on the map and read the popup. The popup is
-   expected to contain a link to /hydrology/rainfallSingle/<id>.
-4. Open that station page.
-5. Set Date = yesterday (Nepal time), Period = Daily, click VIEW.
-6. Read the Accumulated Rainfall table.
-7. Append only dates not already present in output/*.xlsx.
+3. Find the Leaflet station markers.
+4. Click each marker ONE BY ONE.
+5. Read the station name/details from the popup.
+6. Inside that popup, set:
+       Date = yesterday (Nepal time)
+       Period = Daily
+   then click VIEW.
+7. Read the Daily rainfall table shown by that popup.
+8. Save/append the rows to an Excel file named after the station.
+9. Move to the next marker.
 
 Install:
     pip install playwright openpyxl
     playwright install chromium
 
-Useful environment variables:
-    DEBUG=1             save screenshots/html for troubleshooting
-    MAX_STATIONS=10     test only the first N discovered stations
-    HEADLESS=0          show the browser locally
+Test locally first:
+    MAX_STATIONS=3 DEBUG=1 HEADLESS=0 python main.py
+
+For GitHub Actions:
+    MAX_STATIONS=3 DEBUG=1 HEADLESS=1 python main.py
+
+MAX_STATIONS=0 means all stations.
 """
 
 import datetime as dt
-import json
 import os
 import re
 import time
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 MAP_URL = "https://dhm.gov.np/hydrology/rainfall-watch-map"
-STATION_URL = "https://dhm.gov.np/hydrology/rainfallSingle/{}"
 
 OUTPUT_DIR = Path("output")
 DEBUG_DIR = OUTPUT_DIR / "debug"
@@ -43,23 +54,27 @@ HEADLESS = os.getenv("HEADLESS", "1") != "0"
 MAX_STATIONS = int(os.getenv("MAX_STATIONS", "0"))  # 0 = all
 
 
-# ---------------------------------------------------------------------------
-# Date helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+# Nepal date
+# ============================================================
 
 NPT = dt.timezone(dt.timedelta(hours=5, minutes=45))
 
 
 def yesterday_npt():
-    return (dt.datetime.now(NPT).date() - dt.timedelta(days=1))
+    return dt.datetime.now(NPT).date() - dt.timedelta(days=1)
 
 
 def yesterday_iso():
     return yesterday_npt().strftime("%Y-%m-%d")
 
 
+# ============================================================
+# Parsing
+# ============================================================
+
 DATE_FORMATS = [
-    "%a, %b %d, %Y, %I:%M %p",  # Fri, Sep 25, 2026, 12:00 AM
+    "%a, %b %d, %Y, %I:%M %p",
     "%a, %b %d, %Y",
     "%Y-%m-%d",
     "%d %b, %Y",
@@ -73,14 +88,17 @@ DATE_FORMATS = [
 
 
 def parse_date(text):
-    text = text.strip()
+    if not text:
+        return None
+
+    text = " ".join(str(text).split())
+
     for fmt in DATE_FORMATS:
         try:
             return dt.datetime.strptime(text, fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
 
-    # Search inside a longer table cell.
     patterns = [
         r"[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}(?:,\s+\d{1,2}:\d{2}\s*[AP]M)?",
         r"\d{4}-\d{2}-\d{2}",
@@ -88,424 +106,309 @@ def parse_date(text):
         r"\d{1,2}/\d{1,2}/\d{4}",
         r"\d{1,2}-\d{1,2}-\d{4}",
     ]
+
     for pattern in patterns:
-        m = re.search(pattern, text)
-        if m:
-            for fmt in DATE_FORMATS:
-                try:
-                    return dt.datetime.strptime(m.group(0), fmt).strftime("%Y-%m-%d")
-                except ValueError:
-                    pass
+        match = re.search(pattern, text)
+        if not match:
+            continue
+
+        token = match.group(0)
+
+        for fmt in DATE_FORMATS:
+            try:
+                return dt.datetime.strptime(token, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
     return None
 
 
 def parse_number(text):
-    text = text.replace(",", "").strip()
-    if not text:
+    if text is None:
         return None
 
-    # Prefer a decimal/integer token.
-    m = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not m:
+    text = str(text).replace(",", "").strip()
+
+    # Ignore empty / dash / non-numeric cells.
+    if not text or text in {"-", "—", "N/A", "NA"}:
+        return None
+
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+
+    if not match:
         return None
 
     try:
-        return float(m.group(0))
+        return float(match.group(0))
     except ValueError:
         return None
 
 
-# ---------------------------------------------------------------------------
-# General browser helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+# Debug
+# ============================================================
 
 def save_debug(page, tag):
     if not DEBUG:
         return
+
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
     safe = re.sub(r"[^\w.-]+", "_", tag)
-    page.screenshot(path=str(DEBUG_DIR / f"{safe}.png"), full_page=True)
-    (DEBUG_DIR / f"{safe}.html").write_text(
-        page.content(), encoding="utf-8"
-    )
 
-
-def click_text(page, text, timeout=8000):
-    """Click exact visible text, with a few fallbacks."""
-    candidates = [
-        page.get_by_text(text, exact=True).first,
-        page.locator(f"text={text}").first,
-        page.get_by_role("button", name=text, exact=True).first,
-        page.locator(f"a:has-text('{text}')").first,
-        page.locator(f"button:has-text('{text}')").first,
-    ]
-
-    for loc in candidates:
-        try:
-            loc.wait_for(state="visible", timeout=timeout)
-            loc.click()
-            return True
-        except Exception:
-            continue
-
-    return False
-
-
-# ---------------------------------------------------------------------------
-# 1. Open map and click 24 Hour
-# ---------------------------------------------------------------------------
-
-def open_24_hour_map(page):
-    print("Opening DHM Rainfall Watch Map...")
-    page.goto(MAP_URL, wait_until="domcontentloaded", timeout=60000)
-
-    # The page currently exposes the six tabs:
-    # 1 Hour, 3 Hour, 6 Hour, 12 Hour, 24 Hour, Tabular View.
-    if not click_text(page, "24 Hour", timeout=15000):
-        raise RuntimeError("Could not click the '24 Hour' tab.")
-
-    # Give the map layer time to redraw after switching duration.
-    page.wait_for_timeout(2500)
-
-    # Wait until the map itself exists.
     try:
-        page.locator("#map").wait_for(state="visible", timeout=15000)
+        page.screenshot(
+            path=str(DEBUG_DIR / f"{safe}.png"),
+            full_page=True,
+        )
     except Exception:
-        # Some versions may use a different map container.
-        if not page.locator(".leaflet-container").count():
-            raise RuntimeError("DHM map container was not found.")
+        pass
 
-    save_debug(page, "00_24_hour_map")
-    print("24 Hour map loaded.")
-
-
-# ---------------------------------------------------------------------------
-# 2. Click station markers and collect rainfallSingle links
-# ---------------------------------------------------------------------------
-
-def marker_count(page):
-    selectors = [
-        "#map .leaflet-marker-icon",
-        ".leaflet-container .leaflet-marker-icon",
-        "#map .leaflet-interactive",
-        ".leaflet-container .leaflet-interactive",
-    ]
-    count = 0
-    for selector in selectors:
-        try:
-            count = max(count, page.locator(selector).count())
-        except Exception:
-            pass
-    return count
-
-
-def station_id_from_url(url):
-    if not url:
-        return None
-    m = re.search(r"/hydrology/rainfallSingle/(\d+)", url)
-    return m.group(1) if m else None
-
-
-def extract_station_id_from_text(text):
-    """Find a rainfallSingle ID or common station-id attribute in HTML/JS."""
-    if not text:
-        return None
-
-    patterns = [
-        r"/hydrology/rainfallSingle/(\d+)",
-        r"rainfallSingle[\"'\s:/]+(\d+)",
-        r"(?:station[_ -]?id|stationId|stationID|station_number|stationNumber)\s*[=:]\s*[\"']?(\d+)",
-        r"(?:station[_ -]?index|stationIndex)\s*[=:]\s*[\"']?(\d+)",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.I)
-        if m:
-            return m.group(1)
-    return None
-
-
-def extract_station_name(popup_text, station_id):
-    lines = [x.strip() for x in popup_text.splitlines() if x.strip()]
-    bad = {
-        "VIEW", "View", "DETAIL", "Details", "Station",
-        "Rainfall", "Rainfall Watch Map", "24 Hour",
-    }
-
-    for line in lines:
-        if line in bad:
-            continue
-        if re.fullmatch(r"[\d.,\-\s]+", line):
-            continue
-        if "rainfallSingle" in line:
-            continue
-        if len(line) > 1:
-            return line[:150]
-
-    return f"Station_{station_id}"
-
-
-def add_station(stations, station_id, name=None):
-    if not station_id:
-        return False
-    station_id = str(station_id)
-    if station_id in stations:
-        return False
-
-    stations[station_id] = {
-        "url_id": station_id,
-        "name": name or f"Station_{station_id}",
-        "url": STATION_URL.format(station_id),
-    }
-    print(f"  [{len(stations)}] {stations[station_id]['name']} -> {stations[station_id]['url']}")
-    return True
-
-
-def collect_station_links_from_dom(page, stations):
-    """Look everywhere in the rendered DOM, not only inside a popup."""
     try:
-        html = page.content()
+        (DEBUG_DIR / f"{safe}.html").write_text(
+            page.content(),
+            encoding="utf-8",
+        )
     except Exception:
-        html = ""
+        pass
 
-    # Direct rainfallSingle URLs in HTML/inline JavaScript.
-    for sid in re.findall(r"/hydrology/rainfallSingle/(\d+)", html):
-        add_station(stations, sid)
-
-    # Inspect links, buttons and elements carrying URL/data attributes.
     try:
-        elements = page.locator("a,button,[onclick],[data-url],[data-href],[data-id],[data-station-id]")
-        for i in range(min(elements.count(), 5000)):
-            el = elements.nth(i)
-            try:
-                attrs = el.evaluate("""e => ({
-                    text: e.innerText || '',
-                    href: e.getAttribute('href') || '',
-                    onclick: e.getAttribute('onclick') || '',
-                    dataUrl: e.getAttribute('data-url') || '',
-                    dataHref: e.getAttribute('data-href') || '',
-                    dataId: e.getAttribute('data-id') || '',
-                    dataStationId: e.getAttribute('data-station-id') || ''
-                })""")
-                blob = " ".join(str(v) for v in attrs.values())
-                sid = extract_station_id_from_text(blob)
-                if sid:
-                    add_station(stations, sid, attrs.get("text", "").strip() or None)
-            except Exception:
-                continue
+        (DEBUG_DIR / f"{safe}.txt").write_text(
+            page.locator("body").inner_text(),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
 
-def click_popup_station_control(page, popup, stations):
-    """Some DHM versions put the station navigation in a JS button rather
-    than an <a href>. Click those controls and capture the resulting URL."""
-    controls = popup.locator("a,button,[role='button'],[onclick],[data-url],[data-href]")
+# ============================================================
+# Map
+# ============================================================
 
-    for i in range(controls.count()):
-        control = controls.nth(i)
+def click_24_hour(page):
+    print("Opening DHM Rainfall Watch Map...")
+
+    page.goto(
+        MAP_URL,
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+
+    # Wait for the page JavaScript to initialise.
+    page.wait_for_timeout(3000)
+
+    candidates = [
+        page.get_by_text("24 Hour", exact=True).first,
+        page.get_by_role("button", name="24 Hour", exact=True).first,
+        page.locator("a:has-text('24 Hour')").first,
+        page.locator("button:has-text('24 Hour')").first,
+    ]
+
+    clicked = False
+
+    for locator in candidates:
         try:
-            attrs = control.evaluate("""e => ({
-                text: e.innerText || '',
-                href: e.getAttribute('href') || '',
-                onclick: e.getAttribute('onclick') || '',
-                dataUrl: e.getAttribute('data-url') || '',
-                dataHref: e.getAttribute('data-href') || ''
-            })""")
-            blob = " ".join(str(v) for v in attrs.values())
-            sid = extract_station_id_from_text(blob)
-            if sid:
-                add_station(stations, sid, attrs.get("text", "").strip() or None)
-                return True
-
-            text = attrs.get("text", "").strip().lower()
-            if not any(x in text for x in ("view", "detail", "station")):
-                continue
-
-            old_url = page.url
-            control.click(force=True, timeout=3000)
-            page.wait_for_timeout(500)
-
-            sid = station_id_from_url(page.url)
-            if sid:
-                add_station(stations, sid)
-                if page.url != old_url:
-                    page.go_back(wait_until="domcontentloaded", timeout=15000)
-                return True
-        except Exception:
-            continue
-
-    return False
-
-
-def discover_stations_from_map(page):
-    """
-    Discover station IDs from the 24-hour map.
-
-    Important: the DHM map markers do NOT necessarily contain a normal
-    rainfallSingle href inside the Leaflet popup. Earlier code assumed they
-    did, which is why 729 markers could be found but 0 stations discovered.
-
-    This version uses several layers:
-      1. rendered DOM/inline JS scan for rainfallSingle URLs;
-      2. actual marker click + popup inspection;
-      3. clicking View/Details controls inside the popup;
-      4. a Tabular View fallback if the map popup does not expose IDs.
-    """
-    print("Discovering stations from the 24 Hour map...")
-    stations = {}
-
-    # First check whether the page already contains station URLs in its
-    # rendered HTML or JavaScript data.
-    collect_station_links_from_dom(page, stations)
-    if stations:
-        print(f"Found {len(stations)} station URL(s) in the map DOM/data.")
-
-    # Wait for marker rendering.
-    for _ in range(30):
-        if marker_count(page) > 0:
+            locator.wait_for(state="visible", timeout=10000)
+            locator.click(force=True)
+            clicked = True
             break
-        page.wait_for_timeout(500)
-
-    total = marker_count(page)
-    print(f"Found about {total} map marker element(s).")
-
-    # Prefer one marker selector. Using both .leaflet-marker-icon and
-    # .leaflet-interactive previously caused duplicate/overlapping clicks.
-    selector = "#map .leaflet-marker-icon"
-    if page.locator(selector).count() == 0:
-        selector = ".leaflet-container .leaflet-marker-icon"
-
-    loc = page.locator(selector)
-    count = loc.count()
-    print(f"Scanning {count} marker icon(s)...")
-
-    # Do not make a 729-marker scan unnecessarily slow if we already have all
-    # stations from page data. Still allow MAX_STATIONS testing.
-    marker_limit = count
-    if MAX_STATIONS:
-        marker_limit = min(marker_limit, max(MAX_STATIONS * 5, 30))
-
-    for i in range(marker_limit):
-        try:
-            marker = loc.nth(i)
-            if not marker.is_visible():
-                continue
-
-            marker.scroll_into_view_if_needed(timeout=2000)
-            marker.click(force=True, timeout=3000)
-            page.wait_for_timeout(350)
-
-            popup = page.locator(".leaflet-popup").last
-            if not popup.is_visible():
-                # Try a DOM click event as a fallback for Leaflet markers whose
-                # native click is intercepted by an overlay.
-                try:
-                    marker.dispatch_event("click")
-                    page.wait_for_timeout(350)
-                except Exception:
-                    pass
-
-            if not popup.is_visible():
-                continue
-
-            popup_html = popup.inner_html()
-            popup_text = popup.inner_text()
-
-            # 1) direct URL / ID in popup HTML.
-            sid = extract_station_id_from_text(popup_html)
-            if sid:
-                add_station(stations, sid, extract_station_name(popup_text, sid))
-
-            # 2) inspect/click any popup navigation control.
-            click_popup_station_control(page, popup, stations)
-
-            # 3) popup may reveal a station name only. Scan the whole DOM
-            # after the click because DHM can create a hidden link/modal.
-            collect_station_links_from_dom(page, stations)
-
         except Exception:
             pass
 
-        finally:
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
+    if not clicked:
+        raise RuntimeError("Could not click the DHM '24 Hour' button.")
 
-        if MAX_STATIONS and len(stations) >= MAX_STATIONS:
-            break
+    # Give Leaflet enough time to redraw the 24-hour markers.
+    page.wait_for_timeout(4000)
 
-    # Fallback: DHM exposes a Tabular View on the same page. On versions where
-    # Leaflet popups contain only rainfall values, the station rows may expose
-    # the station URL/data-id instead.
-    if not stations:
-        print("No station IDs found from markers; trying Tabular View fallback...")
+    try:
+        page.locator(".leaflet-container").wait_for(
+            state="visible",
+            timeout=15000,
+        )
+    except Exception:
+        pass
+
+    print("24 Hour map loaded.")
+
+
+def get_marker_locator(page):
+    """
+    DHM uses Leaflet. We deliberately use ONLY .leaflet-marker-icon.
+
+    Do not combine .leaflet-marker-icon with .leaflet-interactive:
+    that can count different elements belonging to the same station.
+    """
+
+    selectors = [
+        "#map .leaflet-marker-icon",
+        ".leaflet-container .leaflet-marker-icon",
+    ]
+
+    for selector in selectors:
+        locator = page.locator(selector)
+
         try:
-            if click_text(page, "Tabular View", timeout=8000):
-                page.wait_for_timeout(2000)
-                collect_station_links_from_dom(page, stations)
+            if locator.count() > 0:
+                return locator
+        except Exception:
+            pass
 
-                # Inspect table rows for href/data attributes and station text.
-                tables = page.locator("table")
-                for ti in range(tables.count()):
-                    table = tables.nth(ti)
-                    rows = table.locator("tr")
-                    for ri in range(rows.count()):
-                        row = rows.nth(ri)
-                        try:
-                            html = row.inner_html()
-                            sid = extract_station_id_from_text(html)
-                            if sid:
-                                add_station(stations, sid, row.inner_text().splitlines()[0].strip())
-                        except Exception:
-                            continue
-        except Exception as exc:
-            print(f"Tabular View fallback failed: {exc}")
-
-    save_debug(page, "01_after_station_discovery")
-
-    result = list(stations.values())
-    if MAX_STATIONS:
-        result = result[:MAX_STATIONS]
-
-    print(f"Discovered {len(result)} unique station(s).")
-    return result
+    return None
 
 
-# ---------------------------------------------------------------------------
-# 3. Set Date = yesterday and Period = Daily
-# ---------------------------------------------------------------------------
+def marker_count(page):
+    locator = get_marker_locator(page)
+    return locator.count() if locator else 0
 
-def find_date_input(page):
-    """Find the Date input without assuming a fixed element ID."""
-    inputs = page.locator("input")
+
+# ============================================================
+# Popup helpers
+# ============================================================
+
+def visible_popup(page):
+    """
+    Return the last visible Leaflet popup.
+
+    We intentionally do not require a station ID or station URL.
+    """
+
+    popups = page.locator(".leaflet-popup")
+
+    visible = []
+
+    for i in range(popups.count()):
+        popup = popups.nth(i)
+
+        try:
+            if popup.is_visible():
+                visible.append(popup)
+        except Exception:
+            pass
+
+    return visible[-1] if visible else None
+
+
+def station_name_from_popup(popup, sequence):
+    """
+    Extract the station name from the popup.
+
+    First look for explicit labels such as:
+        Station Name
+        Station
+        Name
+
+    If DHM changes the labels, fall back to the first meaningful text line.
+    """
+
+    try:
+        text = popup.inner_text()
+    except Exception:
+        return f"Station_{sequence:04d}"
+
+    lines = [
+        re.sub(r"\s+", " ", x).strip()
+        for x in text.splitlines()
+        if x.strip()
+    ]
+
+    # Look for:
+    # Station Name: ABC
+    # Station: ABC
+    # Name: ABC
+    label_pattern = re.compile(
+        r"^(?:station\s*name|station|name)\s*[:\-]\s*(.+)$",
+        re.I,
+    )
+
+    for line in lines:
+        match = label_pattern.match(line)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value[:180]
+
+    # Sometimes the label and value are separate lines:
+    # Station Name
+    # ABC
+    for i, line in enumerate(lines[:-1]):
+        if re.fullmatch(
+            r"(?:station\s*name|station|name)",
+            line,
+            re.I,
+        ):
+            candidate = lines[i + 1].strip()
+
+            if candidate and not re.search(
+                r"rainfall|daily|total|date|period|view",
+                candidate,
+                re.I,
+            ):
+                return candidate[:180]
+
+    # Fallback: first useful non-numeric line.
+    ignored = {
+        "VIEW",
+        "View",
+        "DAILY",
+        "Daily",
+        "Date",
+        "Period",
+        "Rainfall",
+        "Accumulated Rainfall",
+        "24 Hour",
+    }
+
+    for line in lines:
+        if line in ignored:
+            continue
+
+        if re.fullmatch(r"[\d.,\-\s]+", line):
+            continue
+
+        if len(line) >= 2:
+            return line[:180]
+
+    return f"Station_{sequence:04d}"
+
+
+# ============================================================
+# Date / Period / VIEW INSIDE POPUP
+# ============================================================
+
+def popup_date_input(popup):
+    inputs = popup.locator("input")
+
     candidates = []
 
     for i in range(inputs.count()):
+        inp = inputs.nth(i)
+
         try:
-            el = inputs.nth(i)
-            attrs = el.evaluate(
+            attrs = inp.evaluate(
                 """e => ({
                     type: e.type || '',
                     id: e.id || '',
                     name: e.name || '',
                     placeholder: e.placeholder || '',
-                    value: e.value || '',
                     aria: e.getAttribute('aria-label') || ''
                 })"""
             )
-            blob = " ".join(str(v).lower() for v in attrs.values())
+
+            blob = " ".join(
+                str(v).lower()
+                for v in attrs.values()
+            )
 
             score = 0
+
             if attrs["type"].lower() == "date":
                 score += 100
+
             if "date" in blob:
                 score += 30
-            if "from" in blob or "start" in blob:
-                score += 5
 
-            candidates.append((score, i, attrs))
+            candidates.append((score, i))
 
         except Exception:
             pass
@@ -518,74 +421,78 @@ def find_date_input(page):
     return None
 
 
-def set_date_yesterday(page):
+def set_popup_date_yesterday(popup):
     target = yesterday_iso()
-    inp = find_date_input(page)
+
+    inp = popup_date_input(popup)
 
     if inp is None:
-        raise RuntimeError("Could not locate the Date input on the station page.")
+        return False
 
-    # First try Playwright fill.
+    # Normal Playwright fill.
     try:
         inp.fill(target, timeout=3000)
     except Exception:
         pass
 
-    # Then explicitly set the DOM value and fire events. This handles date
-    # pickers/framework-bound inputs that ignore a normal fill.
+    # Framework-safe DOM value setter.
     try:
         inp.evaluate(
             """(e, value) => {
                 const setter =
                   Object.getOwnPropertyDescriptor(
-                    HTMLInputElement.prototype, 'value'
+                    HTMLInputElement.prototype,
+                    'value'
                   ).set;
+
                 setter.call(e, value);
-                e.dispatchEvent(new Event('input', {bubbles: true}));
-                e.dispatchEvent(new Event('change', {bubbles: true}));
-                e.blur();
+
+                e.dispatchEvent(
+                    new Event('input', {bubbles: true})
+                );
+
+                e.dispatchEvent(
+                    new Event('change', {bubbles: true})
+                );
             }""",
             target,
         )
     except Exception:
         pass
 
-    # Verify what the browser actually has.
     try:
         actual = inp.input_value()
+        return actual == target
     except Exception:
-        actual = ""
-
-    if actual != target:
-        raise RuntimeError(
-            f"Date input did not accept yesterday. Expected {target}, got {actual!r}"
-        )
-
-    return target
+        return False
 
 
-def set_period_daily(page):
-    selects = page.locator("select")
+def set_popup_period_daily(popup):
+    selects = popup.locator("select")
 
     for i in range(selects.count()):
         select = selects.nth(i)
+
         try:
             options = select.locator("option").all_inner_texts()
-            if any(o.strip().lower() == "daily" for o in options):
+
+            if any(
+                option.strip().lower() == "daily"
+                for option in options
+            ):
                 select.select_option(label="Daily")
                 return True
+
         except Exception:
             pass
 
-    # Fallback if the site uses a custom dropdown.
+    # Some versions may use a custom dropdown.
     for selector in [
-        "label:has-text('Daily')",
-        "text=Daily",
         "[value='daily']",
+        "option:has-text('Daily')",
     ]:
         try:
-            loc = page.locator(selector).first
-            loc.click(timeout=2000)
+            popup.locator(selector).first.click(timeout=2000)
             return True
         except Exception:
             pass
@@ -593,43 +500,67 @@ def set_period_daily(page):
     return False
 
 
-def click_view(page):
-    for selector in [
-        "button:has-text('VIEW')",
-        "input[value='VIEW']",
-        "a:has-text('VIEW')",
-        "text=VIEW",
-    ]:
+def click_popup_view(popup):
+    candidates = [
+        popup.get_by_role(
+            "button",
+            name="VIEW",
+            exact=True,
+        ).first,
+
+        popup.locator(
+            "button:has-text('VIEW')"
+        ).first,
+
+        popup.locator(
+            "input[value='VIEW']"
+        ).first,
+
+        popup.locator(
+            "a:has-text('VIEW')"
+        ).first,
+
+        popup.get_by_text(
+            "VIEW",
+            exact=True,
+        ).first,
+    ]
+
+    for locator in candidates:
         try:
-            loc = page.locator(selector).first
-            loc.wait_for(state="visible", timeout=3000)
-            loc.click()
+            locator.wait_for(
+                state="visible",
+                timeout=2000,
+            )
+
+            locator.click(force=True)
+
             return True
+
         except Exception:
             pass
 
     return False
 
 
-# ---------------------------------------------------------------------------
-# 4. Read the Accumulated Rainfall table
-# ---------------------------------------------------------------------------
+# ============================================================
+# Read table INSIDE popup
+# ============================================================
 
-def read_rainfall_table(page):
-    """
-    Select the table whose header contains Date + Daily. This is safer than
-    simply reading the first <table>, because the station page can contain
-    other tables/HTML elements.
-    """
-    tables = page.locator("table")
+def read_rainfall_table_from_popup(popup):
+    tables = popup.locator("table")
 
     for i in range(tables.count()):
         table = tables.nth(i)
+
         try:
             text = table.inner_text()
             low = text.lower()
 
-            if "date" not in low or "daily" not in low:
+            if "date" not in low:
+                continue
+
+            if "daily" not in low:
                 continue
 
             rows = table.locator("tr")
@@ -637,165 +568,316 @@ def read_rainfall_table(page):
 
             for r in range(rows.count()):
                 cells = rows.nth(r).locator("th, td")
-                vals = [x.strip() for x in cells.all_inner_texts()]
 
-                if len(vals) < 2:
+                values = [
+                    x.strip()
+                    for x in cells.all_inner_texts()
+                ]
+
+                if len(values) < 2:
                     continue
 
-                date_str = parse_date(vals[0])
-                if not date_str:
+                date_value = parse_date(values[0])
+
+                if not date_value:
                     continue
 
-                daily = parse_number(vals[1])
-                total = parse_number(vals[2]) if len(vals) >= 3 else None
+                daily_value = parse_number(values[1])
 
-                if daily is not None:
-                    extracted.append((date_str, daily, total))
+                if daily_value is None:
+                    continue
+
+                total_value = (
+                    parse_number(values[2])
+                    if len(values) >= 3
+                    else None
+                )
+
+                extracted.append(
+                    (
+                        date_value,
+                        daily_value,
+                        total_value,
+                    )
+                )
 
             if extracted:
                 return extracted
 
         except Exception:
-            continue
+            pass
 
     return []
 
 
-def extract_station_history(page, debug_tag):
-    target = set_date_yesterday()
-    daily_ok = set_period_daily()
+def extract_popup_rainfall(popup):
+    """
+    Complete operation on one clicked station popup:
+
+        yesterday -> Daily -> VIEW -> table
+    """
+
+    date_ok = set_popup_date_yesterday(popup)
+
+    if not date_ok:
+        raise RuntimeError(
+            "Date input was not found or could not be set to yesterday."
+        )
+
+    daily_ok = set_popup_period_daily(popup)
 
     if not daily_ok:
-        raise RuntimeError("Could not set Period to Daily.")
-
-    if not click_view(page):
-        raise RuntimeError("Could not click VIEW.")
-
-    # Wait until the table actually appears.
-    try:
-        page.locator("table").filter(
-            has_text="Daily"
-        ).first.wait_for(state="visible", timeout=15000)
-    except Exception:
-        page.wait_for_timeout(3000)
-
-    # Give AJAX-rendered table rows time to settle.
-    page.wait_for_timeout(1000)
-
-    rows = read_rainfall_table(page)
-
-    if DEBUG:
-        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-        (DEBUG_DIR / f"{debug_tag}.txt").write_text(
-            f"target_date={target}\n"
-            f"period_daily={daily_ok}\n"
-            f"rows={rows}\n\n"
-            f"--- PAGE TEXT ---\n"
-            + page.locator("body").inner_text(),
-            encoding="utf-8",
+        raise RuntimeError(
+            "Period dropdown was not found or could not be set to Daily."
         )
-        save_debug(page, debug_tag)
 
-    if not rows:
-        raise RuntimeError("No Daily rainfall table rows were extracted.")
+    if not click_popup_view(popup):
+        raise RuntimeError(
+            "VIEW button was not found inside the station popup."
+        )
 
-    return rows
+    # AJAX table rendering.
+    for _ in range(20):
+        rows = read_rainfall_table_from_popup(popup)
+
+        if rows:
+            return rows
+
+        time.sleep(0.5)
+
+    return []
 
 
-# ---------------------------------------------------------------------------
-# 5. Excel output
-# ---------------------------------------------------------------------------
+# ============================================================
+# Excel
+# ============================================================
 
-def safe_filename(name, station_id):
-    clean = re.sub(r"[^\w\-]+", "_", name).strip("_")
-    return f"{station_id}_{clean or 'station'}.xlsx"
+def safe_filename(name, sequence):
+    clean = re.sub(
+        r"[^\w\-]+",
+        "_",
+        name,
+    ).strip("_")
+
+    if not clean:
+        clean = f"Station_{sequence:04d}"
+
+    return f"{sequence:04d}_{clean}.xlsx"
 
 
 def existing_dates(path):
     if not path.exists():
         return set()
 
-    wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb.active
+    wb = load_workbook(
+        path,
+        read_only=True,
+        data_only=True,
+    )
 
-    found = set()
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    ws = wb.active
+    dates = set()
+
+    for row in ws.iter_rows(
+        min_row=2,
+        values_only=True,
+    ):
         if not row or row[0] is None:
             continue
 
         value = row[0]
+
         if isinstance(value, dt.datetime):
-            found.add(value.strftime("%Y-%m-%d"))
+            dates.add(value.strftime("%Y-%m-%d"))
+
         elif isinstance(value, dt.date):
-            found.add(value.strftime("%Y-%m-%d"))
+            dates.add(value.strftime("%Y-%m-%d"))
+
         else:
             parsed = parse_date(str(value))
+
             if parsed:
-                found.add(parsed)
-            else:
-                found.add(str(value))
+                dates.add(parsed)
 
     wb.close()
-    return found
+
+    return dates
 
 
 def append_rows(path, rows):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     if path.exists():
         wb = load_workbook(path)
         ws = wb.active
+
     else:
         wb = Workbook()
         ws = wb.active
         ws.title = "Daily Rainfall"
-        ws.append([
-            "Date",
-            "Daily Rainfall (mm)",
-            "Running Total on page (mm)",
-        ])
+
+        ws.append(
+            [
+                "Date",
+                "Daily Rainfall (mm)",
+                "Running Total on page (mm)",
+            ]
+        )
 
     existing = existing_dates(path)
 
     added = 0
-    for date_str, daily, total in sorted(rows):
-        if date_str in existing:
+
+    for date_value, daily, total in sorted(rows):
+        if date_value in existing:
             continue
 
-        ws.append([date_str, daily, total])
-        added += 1
-        existing.add(date_str)
+        ws.append(
+            [
+                date_value,
+                daily,
+                total,
+            ]
+        )
 
-    # Store actual Excel dates for easier sorting/filtering.
+        existing.add(date_value)
+        added += 1
+
+    # Convert Date column to real Excel dates.
     for cell in ws["A"][1:]:
         if isinstance(cell.value, str):
             try:
                 cell.value = dt.datetime.strptime(
-                    cell.value, "%Y-%m-%d"
+                    cell.value,
+                    "%Y-%m-%d",
                 ).date()
+
                 cell.number_format = "yyyy-mm-dd"
+
             except ValueError:
                 pass
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+
     wb.save(path)
 
     return added
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
+# Process ONE marker
+# ============================================================
+
+def process_marker(page, marker, sequence):
+    """
+    Click exactly one Leaflet marker and work entirely from its popup.
+
+    No station ID is required.
+    """
+
+    # Close any previous popup.
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    try:
+        marker.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+
+    # Normal click first.
+    clicked = False
+
+    try:
+        marker.click(
+            force=True,
+            timeout=5000,
+        )
+        clicked = True
+    except Exception:
+        pass
+
+    if not clicked:
+        try:
+            marker.dispatch_event("click")
+            clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        raise RuntimeError(
+            "Could not click marker."
+        )
+
+    # Wait for popup.
+    popup = None
+
+    for _ in range(20):
+        popup = visible_popup(page)
+
+        if popup is not None:
+            break
+
+        time.sleep(0.25)
+
+    if popup is None:
+        raise RuntimeError(
+            "Marker was clicked but no Leaflet popup appeared."
+        )
+
+    station_name = station_name_from_popup(
+        popup,
+        sequence,
+    )
+
+    if DEBUG:
+        save_debug(
+            page,
+            f"marker_{sequence:04d}_before_view",
+        )
+
+    print(
+        f"    popup station: {station_name}"
+    )
+
+    rows = extract_popup_rainfall(popup)
+
+    if DEBUG:
+        save_debug(
+            page,
+            f"marker_{sequence:04d}_after_view",
+        )
+
+    if not rows:
+        raise RuntimeError(
+            "VIEW completed but no Daily rainfall table "
+            "was found inside the popup."
+        )
+
+    return station_name, rows
+
+
+# ============================================================
 # Main
-# ---------------------------------------------------------------------------
+# ============================================================
 
 def main():
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    run_time = dt.datetime.now(dt.timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
+    print(
+        f"Yesterday in Nepal: {yesterday_iso()}"
     )
 
     with sync_playwright() as p:
+
         browser = p.chromium.launch(
             headless=HEADLESS,
             args=[
@@ -805,73 +887,183 @@ def main():
         )
 
         context = browser.new_context(
-            viewport={"width": 1440, "height": 1000},
+            viewport={
+                "width": 1440,
+                "height": 1000,
+            },
             locale="en-US",
             timezone_id="Asia/Kathmandu",
         )
 
-        map_page = context.new_page()
+        page = context.new_page()
 
         try:
-            open_24_hour_map(map_page)
-            stations = discover_stations_from_map(map_page)
+            # --------------------------------------------------
+            # Map
+            # --------------------------------------------------
 
-            if not stations:
+            click_24_hour(page)
+
+            # Wait until Leaflet markers appear.
+            marker_locator = None
+
+            for _ in range(40):
+                marker_locator = get_marker_locator(page)
+
+                if marker_locator and marker_locator.count() > 0:
+                    break
+
+                page.wait_for_timeout(500)
+
+            if marker_locator is None:
                 raise RuntimeError(
-                    "No station links were discovered by clicking the map. "
-                    "Run with DEBUG=1 HEADLESS=0 to inspect the map."
+                    "No Leaflet station markers were found."
                 )
 
-            print("\nStarting station extraction...")
-            print(f"Yesterday in Nepal: {yesterday_iso()}")
-            print(f"Run time: {run_time}\n")
+            total = marker_locator.count()
 
-            for number, station in enumerate(stations, start=1):
-                station_id = station["url_id"]
-                name = station["name"]
-                url = station["url"]
+            print(
+                f"Found about {total} map station marker(s)."
+            )
 
-                print(f"[{number}/{len(stations)}] {name} ({station_id})")
+            if MAX_STATIONS:
+                total_to_process = min(
+                    total,
+                    MAX_STATIONS,
+                )
+            else:
+                total_to_process = total
 
-                station_page = context.new_page()
+            print(
+                f"Will process {total_to_process} station(s)."
+            )
+
+            # --------------------------------------------------
+            # Station-by-station popup extraction
+            # --------------------------------------------------
+
+            successful = 0
+            failed = 0
+
+            for sequence in range(
+                1,
+                total_to_process + 1,
+            ):
+
+                print(
+                    f"\n[{sequence}/{total_to_process}] "
+                    f"Clicking station marker..."
+                )
 
                 try:
-                    station_page.goto(
-                        url,
-                        wait_until="domcontentloaded",
-                        timeout=60000,
+                    # Re-create the locator each time because the DOM can
+                    # change after a popup AJAX update.
+                    marker_locator = get_marker_locator(page)
+
+                    if marker_locator is None:
+                        raise RuntimeError(
+                            "Leaflet marker locator disappeared."
+                        )
+
+                    if sequence > marker_locator.count():
+                        raise RuntimeError(
+                            "Marker count changed while processing."
+                        )
+
+                    marker = marker_locator.nth(
+                        sequence - 1
                     )
 
-                    station_page.wait_for_timeout(1000)
-
-                    rows = extract_station_history(
-                        station_page,
-                        f"station_{station_id}",
+                    station_name, rows = process_marker(
+                        page,
+                        marker,
+                        sequence,
                     )
 
-                    path = OUTPUT_DIR / safe_filename(name, station_id)
-                    added = append_rows(path, rows)
+                    filename = safe_filename(
+                        station_name,
+                        sequence,
+                    )
+
+                    path = OUTPUT_DIR / filename
+
+                    added = append_rows(
+                        path,
+                        rows,
+                    )
 
                     print(
-                        f"    extracted {len(rows)} row(s); "
-                        f"added {added} new row(s) -> {path}"
+                        f"    rainfall rows: {len(rows)}"
                     )
 
+                    print(
+                        f"    added: {added} new row(s)"
+                    )
+
+                    print(
+                        f"    Excel: {path}"
+                    )
+
+                    successful += 1
+
                 except Exception as exc:
-                    print(f"    FAILED: {exc}")
-                    save_debug(station_page, f"ERROR_station_{station_id}")
+
+                    failed += 1
+
+                    print(
+                        f"    FAILED: {exc}"
+                    )
+
+                    save_debug(
+                        page,
+                        f"ERROR_marker_{sequence:04d}",
+                    )
 
                 finally:
-                    station_page.close()
+                    # Close popup before moving to the next marker.
+                    try:
+                        close_button = page.locator(
+                            ".leaflet-popup-close-button"
+                        ).last
 
-                # Small delay so the site is not hammered.
-                time.sleep(0.75)
+                        if close_button.is_visible():
+                            close_button.click(
+                                force=True
+                            )
+                            page.wait_for_timeout(
+                                250
+                            )
+
+                    except Exception:
+                        pass
+
+                # Be polite to DHM.
+                time.sleep(0.4)
+
+            print(
+                "\n======================================"
+            )
+
+            print(
+                "Finished."
+            )
+
+            print(
+                f"Successful stations: {successful}"
+            )
+
+            print(
+                f"Failed stations: {failed}"
+            )
+
+            print(
+                f"Output folder: {OUTPUT_DIR.resolve()}"
+            )
 
         finally:
-            map_page.close()
+            page.close()
+            context.close()
             browser.close()
-
-    print("\nDone.")
 
 
 if __name__ == "__main__":
