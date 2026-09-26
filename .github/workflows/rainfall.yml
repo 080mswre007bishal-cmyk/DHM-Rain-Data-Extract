@@ -1,15 +1,21 @@
 name: DHM Rainfall Scrape
 
+# Runs main.py automatically twice a day, on GitHub's servers, for free.
+# Visits each station's own page (dhm.gov.np/hydrology/rainfallSingle/<id>,
+# via stations.json), sets Period to Daily, clicks VIEW, reads the
+# Date/Daily/Total table, and appends only new dates to
+# output/<station>.xlsx. Google Drive upload is currently disabled --
+# see the note near the bottom of main.py's main() function for how to
+# turn it back on. In the meantime, every run's output/*.xlsx files are
+# attached to that run as a downloadable artifact (see the last step
+# below).
+
 on:
   schedule:
     # Times are UTC. Nepal is UTC+5:45.
-    # 04:15 UTC = 10:00 AM NPT
-    # 15:45 UTC = 09:30 PM NPT
-    # 18:15 UTC = 12:00 AM midnight NPT (next day)
-    - cron: "15 4 * * *"
-    - cron: "45 15 * * *"
-    - cron: "15 18 * * *"
-
+    # 03:15 UTC = 09:00 NPT, 15:15 UTC = 21:00 NPT.
+    # Adjust to whenever DHM's daily reading is actually published if needed.
+    - cron: "15 3,15 * * *"
   workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
 
 jobs:
@@ -28,15 +34,12 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run scraper
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: python main.py
 
-      - name: Upload run artifacts
+      - name: Upload output (Excel files + debug, if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rainfall-output-${{ github.run_id }}
           path: output/
-          retention-days: 7
+          retention-days: 30

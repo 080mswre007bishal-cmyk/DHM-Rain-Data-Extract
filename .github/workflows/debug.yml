@@ -1,24 +1,33 @@
 name: Debug Rainfall Extraction
 
+# Run this manually from the Actions tab BEFORE trusting the twice-daily
+# job: Actions -> "Debug Rainfall Extraction" -> "Run workflow". It tests
+# a few stations and saves a screenshot + the page text from right after
+# clicking VIEW for each one, as a downloadable zip attached to the run
+# (look for "Artifacts" at the bottom of the run's summary page).
+#
+# Also check the run's LOGS: for each station it prints a line like
+# "read N day(s): [('2026-06-10', 12.4), ...]" -- compare those
+# (date, value) pairs against the real 8-day table in the matching
+# .txt file. If they're wrong, edit extract_rainfall_history() in
+# main.py (you can edit it right here on GitHub -- open main.py,
+# click the pencil icon) using that .txt file as your reference for
+# what really appears on the page.
 on:
   workflow_dispatch:
     inputs:
       station_count:
         description: "How many stations to test"
+        default: "10"
         required: true
-        default: "3"
-        type: string
 
 jobs:
   debug:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -27,18 +36,14 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Run debug scrape + Google Drive upload
+      - name: Run debug scrape (no Drive upload happens in debug mode)
         env:
-          DEBUG_STATIONS: ${{ inputs.station_count }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-        run: |
-          python main.py
+          DEBUG_STATIONS: ${{ github.event.inputs.station_count }}
+        run: python main.py
 
-      - name: Upload debug output
-        if: always()
+      - name: Upload debug screenshots + text
         uses: actions/upload-artifact@v4
         with:
-          name: debug-output-${{ github.run_id }}
-          path: output/
+          name: debug-output
+          path: output/debug/
           retention-days: 7
