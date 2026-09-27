@@ -1,33 +1,44 @@
-name: Discover Stations (run once)
+name: Discover Stations
 
-# Run this manually, ONCE, from the Actions tab: Actions -> "Discover
-# Stations (run once)" -> "Run workflow". It sweeps DHM's plain HTML
-# pages, builds stations.json, and commits it straight back into your
-# repo -- nothing to download or upload by hand. Takes ~10-15 minutes.
+# Automatically updates stations.json once every week.
+# You can also run it manually from:
+# Actions -> "Discover Stations" -> "Run workflow"
+
 on:
   workflow_dispatch: {}
 
+  schedule:
+    # Every Sunday at 2:00 AM Nepal time
+    # Nepal = UTC +5:45
+    # Therefore: Saturday 20:15 UTC
+    - cron: "15 20 * * 6"
+
 permissions:
-  contents: write   # needed so the workflow can commit stations.json back
+  contents: write
 
 jobs:
   discover:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: |
+          pip install requests beautifulsoup4
 
       - name: Run discovery sweep
-        run: python discover_stations.py
+        run: |
+          python discover_stations.py
 
       - name: Commit stations.json to the repo
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Add/update stations.json from discovery sweep"
+          commit_message: "Update stations.json from weekly discovery"
           file_pattern: stations.json
