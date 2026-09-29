@@ -4,8 +4,9 @@ on:
   workflow_dispatch: {}
 
   schedule:
-    # Every Friday at 1:00 AM Nepal time = Thursday 19:15 UTC
-    - cron: "15 19 * * 4"
+    # Every Tuesday and Friday at 1:00 AM Nepal time
+    # = Monday and Thursday at 19:15 UTC
+    - cron: "15 19 * * 1,4"
 
 jobs:
   rainfall:
