@@ -4,17 +4,15 @@ on:
   workflow_dispatch: {}
 
   schedule:
-    # 1:00 AM Nepal time = 19:15 UTC previous day
-    - cron: "15 19 * * *"
-
-    # 10:00 AM Nepal time = 04:15 UTC
-    - cron: "15 4 * * *"
+    # Every Friday at 1:00 AM Nepal time = Thursday 19:15 UTC
+    - cron: "15 19 * * 4"
 
 jobs:
   rainfall:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
