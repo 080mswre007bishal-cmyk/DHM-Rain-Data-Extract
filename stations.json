@@ -1285,7 +1285,7 @@
     "station_index": "0424",
     "latitude": "29.085353187995",
     "longitude": "81.532305316883",
-    "elevation": "1281",
+    "elevation": "1250",
     "district": "DAILEKH",
     "description": "Rainfall station(0424)"
   },
@@ -1698,6 +1698,16 @@
     "elevation": "1477",
     "district": "KATHMANDU",
     "description": "1076"
+  },
+  {
+    "url_id": 413,
+    "name": "Dhap (Tarnamlang)",
+    "station_index": "1078",
+    "latitude": "27.901559",
+    "longitude": "85.632553",
+    "elevation": "1362",
+    "district": "SINDHUPALCHOWK",
+    "description": "1078"
   },
   {
     "url_id": 414,
@@ -2187,7 +2197,7 @@
     "longitude": "81.14630111",
     "elevation": "3068",
     "district": "DOTI",
-    "description": "0211"
+    "description": "AWS under DHM/MFD/G/NCB/01-2082/83 at 29.388889, 81.146389"
   },
   {
     "url_id": 539,
@@ -2276,7 +2286,7 @@
     "latitude": "28.48984389",
     "longitude": "80.96954306",
     "elevation": "132",
-    "district": "ACHHAM",
+    "district": "KAILALI",
     "description": "0244"
   },
   {
@@ -3090,6 +3100,16 @@
     "description": "0802"
   },
   {
+    "url_id": 758,
+    "name": "Pokhara Airport",
+    "station_index": "0804",
+    "latitude": "28.20018333",
+    "longitude": "83.97952222",
+    "elevation": "804",
+    "district": "KASKI",
+    "description": "Shifted on 1st March 2023 from 28.20018333, 83.97952222, 827m to 28.188621, 84.0169252, 804"
+  },
+  {
     "url_id": 761,
     "name": "Kunchha",
     "station_index": "0807",
@@ -3878,6 +3898,16 @@
     "elevation": "",
     "district": "",
     "description": "Rainfall Station installed by WRDDC"
+  },
+  {
+    "url_id": 889,
+    "name": "Syangja",
+    "station_index": "0805",
+    "latitude": "28.098775",
+    "longitude": "83.872177",
+    "elevation": "871",
+    "district": "SYANGJA",
+    "description": "Tier 3 Station"
   },
   {
     "url_id": 893,
