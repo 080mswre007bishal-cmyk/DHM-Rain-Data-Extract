@@ -70,16 +70,6 @@
     "description": "Old Station at 28.353056, 81.719444, 265 m (Elevation might be error) ).Site changed due to Flood of 2071 BS."
   },
   {
-    "url_id": 30,
-    "name": "Bheri at Samaijighat",
-    "station_index": "269.5",
-    "latitude": "28.5167",
-    "longitude": "81.6667",
-    "elevation": "",
-    "district": "Surkhet",
-    "description": "Hydrological station at Samaijhighat with RLS"
-  },
-  {
     "url_id": 31,
     "name": "Bimalnagar (Rainfall)",
     "station_index": "439.7",
@@ -548,16 +538,6 @@
     "elevation": "",
     "district": "Bardiya",
     "description": "Climate Station; need to merge with Gulariya under OHM, Bhairahawa as same location station"
-  },
-  {
-    "url_id": 98,
-    "name": "Tharmare",
-    "station_index": "0519",
-    "latitude": "28.452255",
-    "longitude": "82.27985306",
-    "elevation": "1338",
-    "district": "SALYAN",
-    "description": "Rainfall Station"
   },
   {
     "url_id": 99,
@@ -4108,16 +4088,6 @@
     "elevation": "1547",
     "district": "Gulmi",
     "description": "Tier 3 station"
-  },
-  {
-    "url_id": 937,
-    "name": "Tansen_AWS",
-    "station_index": "70201",
-    "latitude": "27.8621931",
-    "longitude": "83.5376502",
-    "elevation": "1177",
-    "district": "Palpa",
-    "description": "Tier 2 - Agromet"
   },
   {
     "url_id": 939,
