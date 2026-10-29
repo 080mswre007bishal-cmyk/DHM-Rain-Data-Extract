@@ -12,7 +12,7 @@ For every station in stations.json:
   5. In the station popup/panel, select "Daily".
   6. Click "VIEW".
   7. Read the Date | Daily Rainfall table.
-  8. Skip today's row.
+  8. Keep only dates strictly before MANUAL_CUTOFF_DATE.
   9. Save the data locally as output/<station>.xlsx.
  10. Create/find a separate Google Spreadsheet for this station.
  11. Add only dates that are not already present in that
@@ -116,6 +116,11 @@ NEPAL_OFFSET = datetime.timedelta(
     hours=5,
     minutes=45
 )
+
+# MANUAL CUTOFF DATE:
+# Only extract/save rainfall observations strictly BEFORE this date.
+# For 2026-10-26, the latest eligible date is 2026-10-25.
+MANUAL_CUTOFF_DATE = "2026-10-26"
 
 
 # ============================================================
@@ -249,8 +254,8 @@ def _excel_date_set(path):
 
 def find_missing_dates_from_excel(path):
     """
-    Detect gaps from the earliest date already stored in Excel through
-    yesterday in Nepal time. Today's row is intentionally excluded.
+    Detect gaps from the earliest date already stored in Excel up to the
+    day before MANUAL_CUTOFF_DATE.
 
     If no usable Excel dates exist, return [] because there is no reliable
     start date for an automatic historical backfill.
@@ -260,8 +265,8 @@ def find_missing_dates_from_excel(path):
         print("   No existing Excel dates; date-gap backfill has no start date yet.")
         return []
 
-    today = datetime.date.fromisoformat(nepal_today_iso())
-    end_date = today - datetime.timedelta(days=1)
+    cutoff_date = datetime.date.fromisoformat(MANUAL_CUTOFF_DATE)
+    end_date = cutoff_date - datetime.timedelta(days=1)
     start_date = min(datetime.date.fromisoformat(d) for d in existing)
 
     if start_date > end_date:
@@ -1382,7 +1387,7 @@ def process_station(
             ...
         ]
 
-    Today's row is excluded.
+    Only rows dated strictly before MANUAL_CUTOFF_DATE are retained.
     """
 
     station_index = station.get(
@@ -1631,6 +1636,29 @@ def process_station(
         )
 
     # --------------------------------------------------------
+    # Set the DHM panel date to the manually configured cutoff
+    # before clicking VIEW. The table is then parsed using the
+    # existing table parser, and the cutoff filter below keeps
+    # only records strictly earlier than MANUAL_CUTOFF_DATE.
+    # --------------------------------------------------------
+
+    date_set_ok = set_panel_date(
+        panel,
+        MANUAL_CUTOFF_DATE,
+    )
+
+    if date_set_ok:
+        print(
+            f"   DHM date control set to {MANUAL_CUTOFF_DATE}."
+        )
+    else:
+        print(
+            f"   WARNING: Could not identify/set a DHM date control "
+            f"to {MANUAL_CUTOFF_DATE}; VIEW will still be clicked, "
+            f"and the displayed table will be parsed as before."
+        )
+
+    # --------------------------------------------------------
     # Click VIEW
     # --------------------------------------------------------
 
@@ -1691,24 +1719,31 @@ def process_station(
     )
 
     # --------------------------------------------------------
-    # Remove today's row
+    # Keep only rows strictly before the manual cutoff date
     # --------------------------------------------------------
 
-    today = nepal_today_iso()
+    cutoff_date = datetime.date.fromisoformat(MANUAL_CUTOFF_DATE)
 
     kept_rows = [
         row
         for row in all_rows
-        if row[0] != today
+        if datetime.date.fromisoformat(row[0]) < cutoff_date
     ]
 
-    if today in {
-        row[0]
-        for row in all_rows
-    }:
+    excluded_rows = [
+        row for row in all_rows
+        if datetime.date.fromisoformat(row[0]) >= cutoff_date
+    ]
 
+    print(
+        f"   Manual cutoff: {MANUAL_CUTOFF_DATE} "
+        f"(only dates before this date are eligible)."
+    )
+
+    if excluded_rows:
         print(
-            f"   Skipped today's row: {today}"
+            f"   Excluded {len(excluded_rows)} row(s) dated "
+            f"on or after {MANUAL_CUTOFF_DATE}."
         )
 
     # --------------------------------------------------------
@@ -1717,7 +1752,10 @@ def process_station(
 
     recovered = {date_str: value for date_str, value in kept_rows}
     missing_dates = missing_dates or []
-    dates_to_try = [d for d in missing_dates if d != today and d not in recovered]
+    dates_to_try = [
+        d for d in missing_dates
+        if d < MANUAL_CUTOFF_DATE and d not in recovered
+    ]
 
     if dates_to_try:
         print(f"   Excel gap detection found {len(dates_to_try)} date(s) to attempt.")
@@ -1746,8 +1784,9 @@ def process_station(
             f"filtered_ok: {filtered_ok}\n"
             f"marker_clicked: {marker_clicked}\n"
             f"period_ok: {period_ok}\n"
+            f"date_set_ok: {date_set_ok}\n"
             f"view_ok: {view_ok}\n"
-            f"today: {today}\n"
+            f"manual_cutoff_date: {MANUAL_CUTOFF_DATE}\n"
             f"missing_dates_requested: {dates_to_try if missing_dates else []}\n"
             f"all_rows: {all_rows}\n"
             f"kept_rows: {kept_rows}\n",
@@ -2663,7 +2702,7 @@ def main():
             if missing_dates:
                 print(
                     f"   Excel gap check: {len(missing_dates)} missing date(s) "
-                    f"from {missing_dates[0]} through {missing_dates[-1]} (today excluded)."
+                    f"from {missing_dates[0]} through {missing_dates[-1]} (dates on/after manual cutoff excluded)."
                 )
 
             # ------------------------------------------------
