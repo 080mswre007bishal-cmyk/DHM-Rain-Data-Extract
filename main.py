@@ -218,6 +218,66 @@ def nepal_today_iso():
     )
 
 
+
+def _excel_date_set(path):
+    """Return normalized dates already stored in a station Excel file."""
+    dates = set()
+    if not os.path.exists(path):
+        return dates
+
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row or row[0] is None:
+                continue
+            value = row[0]
+            if isinstance(value, datetime.datetime):
+                dates.add(value.date().strftime("%Y-%m-%d"))
+            elif isinstance(value, datetime.date):
+                dates.add(value.strftime("%Y-%m-%d"))
+            else:
+                parsed = parse_date_token(str(value).strip())
+                if parsed:
+                    dates.add(parsed)
+        wb.close()
+    except Exception as exc:
+        print(f"   WARNING: could not read existing Excel dates: {exc}")
+
+    return dates
+
+
+def find_missing_dates_from_excel(path):
+    """
+    Detect gaps from the earliest date already stored in Excel through
+    yesterday in Nepal time. Today's row is intentionally excluded.
+
+    If no usable Excel dates exist, return [] because there is no reliable
+    start date for an automatic historical backfill.
+    """
+    existing = _excel_date_set(path)
+    if not existing:
+        print("   No existing Excel dates; date-gap backfill has no start date yet.")
+        return []
+
+    today = datetime.date.fromisoformat(nepal_today_iso())
+    end_date = today - datetime.timedelta(days=1)
+    start_date = min(datetime.date.fromisoformat(d) for d in existing)
+
+    if start_date > end_date:
+        return []
+
+    missing = []
+    day = start_date
+    while day <= end_date:
+        iso = day.strftime("%Y-%m-%d")
+        if iso not in existing:
+            missing.append(iso)
+        day += datetime.timedelta(days=1)
+
+    return missing
+
+
 # ============================================================
 # DATE / NUMBER PARSING
 # ============================================================
@@ -859,6 +919,118 @@ def click_view_in_panel(
 
 
 # ============================================================
+# HISTORICAL DATE SELECTOR
+# ============================================================
+
+def set_panel_date(panel, target_iso):
+    """
+    Try to set a visible DHM date/date-range field to target_iso.
+
+    The scraper does not assume a date selector exists. It only edits inputs
+    whose type or attributes identify them as date-related. If DHM uses a
+    custom calendar that cannot be recognized, this returns False and the
+    station's panel HTML debug file should be inspected before adapting it.
+    """
+    target = datetime.date.fromisoformat(target_iso)
+    formats = [
+        target_iso,
+        target.strftime("%d/%m/%Y"),
+        target.strftime("%m/%d/%Y"),
+        target.strftime("%d-%m-%Y"),
+        target.strftime("%d %b, %Y"),
+        target.strftime("%d %B, %Y"),
+    ]
+    changed = 0
+
+    # Date inputs and text inputs explicitly labelled as date controls.
+    try:
+        inputs = panel.locator("input:visible")
+        for i in range(inputs.count()):
+            field = inputs.nth(i)
+            try:
+                meta = field.evaluate("el => ({type: (el.type || '').toLowerCase(), name: el.name || '', id: el.id || '', placeholder: el.placeholder || '', aria: el.getAttribute('aria-label') || '', title: el.title || '', value: el.value || ''})")
+                field_type = meta.get("type", "")
+                descriptor = " ".join(str(meta.get(k, "")) for k in ("name", "id", "placeholder", "aria", "title")).lower()
+                is_date = field_type in ("date", "datetime-local") or any(word in descriptor for word in ("date", "datepicker", "start date", "end date", "from date", "to date"))
+                if not is_date:
+                    continue
+
+                if field_type == "date":
+                    value = target_iso
+                elif field_type == "datetime-local":
+                    value = target_iso + "T00:00"
+                else:
+                    value = next((v for v in formats if v in (meta.get("value", ""))), formats[0])
+
+                field.fill(value, timeout=1500)
+                changed += 1
+                print(f"   Set date field '{descriptor or field_type}' to {value}")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Some DHM builds may use a select whose option value/label is a date.
+    try:
+        selects = panel.locator("select:visible")
+        for i in range(selects.count()):
+            sel = selects.nth(i)
+            try:
+                opts = sel.locator("option").evaluate_all("els => els.map(e => ({label: (e.textContent || '').trim(), value: e.value || ''}))")
+                chosen = None
+                for opt in opts:
+                    candidates = [opt.get("value", ""), opt.get("label", "")]
+                    for candidate in candidates:
+                        parsed = None
+                        for pattern in DATE_PATTERNS:
+                            match = re.search(pattern, candidate or "")
+                            if match:
+                                parsed = parse_date_token(match.group(0))
+                                if parsed:
+                                    break
+                        if parsed == target_iso:
+                            chosen = opt
+                            break
+                    if chosen:
+                        break
+                if chosen:
+                    try:
+                        sel.select_option(value=chosen["value"], timeout=1500)
+                    except Exception:
+                        sel.select_option(label=chosen["label"], timeout=1500)
+                    changed += 1
+                    print(f"   Selected date option for {target_iso}")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return changed > 0
+
+
+def fetch_one_historical_date(page, panel, target_iso):
+    """Select one historical date, click VIEW, and return its rainfall row if found."""
+    print(f"   Backfill attempt: {target_iso}")
+    if not set_panel_date(panel, target_iso):
+        print("   WARNING: no recognizable date input/select was found; cannot select this date automatically.")
+        return False
+
+    if not click_view_in_panel(panel):
+        print(f"   WARNING: VIEW click failed for {target_iso}")
+        return None
+
+    page.wait_for_timeout(1800)
+    rows = table_rows_from_panel(panel)
+    for date_str, rainfall in rows:
+        if date_str == target_iso:
+            print(f"   Recovered {target_iso}: {rainfall} mm")
+            return (date_str, rainfall)
+
+    print(f"   WARNING: DHM did not return a rainfall row for {target_iso}.")
+    return None
+
+
+# ============================================================
 # TABLE PARSING
 # ============================================================
 
@@ -1199,7 +1371,8 @@ def close_any_panel(page):
 def process_station(
     page,
     station,
-    debug_tag=None
+    debug_tag=None,
+    missing_dates=None,
 ):
     """
     Returns:
@@ -1539,6 +1712,29 @@ def process_station(
         )
 
     # --------------------------------------------------------
+    # Backfill missing dates detected from the existing Excel file
+    # --------------------------------------------------------
+
+    recovered = {date_str: value for date_str, value in kept_rows}
+    missing_dates = missing_dates or []
+    dates_to_try = [d for d in missing_dates if d != today and d not in recovered]
+
+    if dates_to_try:
+        print(f"   Excel gap detection found {len(dates_to_try)} date(s) to attempt.")
+        for target_iso in dates_to_try:
+            try:
+                row = fetch_one_historical_date(page, panel, target_iso)
+                if row is False:
+                    print("   Stopping automatic backfill because DHM's date selector was not recognized.")
+                    break
+                if row:
+                    recovered[row[0]] = row[1]
+            except Exception as exc:
+                print(f"   WARNING: backfill failed for {target_iso}: {exc}")
+
+        kept_rows = sorted(recovered.items())
+
+    # --------------------------------------------------------
     # Debug result
     # --------------------------------------------------------
 
@@ -1552,6 +1748,7 @@ def process_station(
             f"period_ok: {period_ok}\n"
             f"view_ok: {view_ok}\n"
             f"today: {today}\n"
+            f"missing_dates_requested: {dates_to_try if missing_dates else []}\n"
             f"all_rows: {all_rows}\n"
             f"kept_rows: {kept_rows}\n",
         )
@@ -2459,7 +2656,18 @@ def main():
                 )
 
             # ------------------------------------------------
-            # Scrape station
+            # Detect missing dates from local Excel before scraping
+            # ------------------------------------------------
+
+            missing_dates = find_missing_dates_from_excel(filepath)
+            if missing_dates:
+                print(
+                    f"   Excel gap check: {len(missing_dates)} missing date(s) "
+                    f"from {missing_dates[0]} through {missing_dates[-1]} (today excluded)."
+                )
+
+            # ------------------------------------------------
+            # Process station
             # ------------------------------------------------
 
             try:
@@ -2468,6 +2676,7 @@ def main():
                     page,
                     station,
                     debug_tag=debug_tag,
+                    missing_dates=missing_dates,
                 )
 
             except Exception as e:
