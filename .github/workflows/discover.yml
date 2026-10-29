@@ -1,24 +1,29 @@
+
 name: Discover Stations
 
 # Automatically updates stations.json once every week.
-# You can also run it manually from:
-# Actions -> "Discover Stations" -> "Run workflow"
+# Can also be run manually from:
+# Actions -> Discover Stations -> Run workflow
 
 on:
   workflow_dispatch: {}
 
   schedule:
-    # Every Sunday at 2:00 AM Nepal time
-    # Nepal = UTC +5:45
-    # Therefore: Saturday 20:15 UTC
+    # Every Sunday at 2:00 AM Nepal time = Saturday 20:15 UTC
     - cron: "15 20 * * 6"
 
 permissions:
   contents: write
 
+# Prevent overlapping runs from modifying the same file.
+concurrency:
+  group: discover-stations
+  cancel-in-progress: false
+
 jobs:
   discover:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -31,11 +36,40 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests beautifulsoup4
+          python -m pip install requests beautifulsoup4
 
       - name: Run discovery sweep
         run: |
           python discover_stations.py
+
+      - name: Validate stations.json
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("stations.json")
+
+          if not path.is_file():
+              raise SystemExit("ERROR: stations.json does not exist.")
+
+          try:
+              with path.open(encoding="utf-8") as f:
+                  data = json.load(f)
+          except Exception as e:
+              raise SystemExit(f"ERROR: Invalid JSON: {e}")
+
+          if not isinstance(data, (list, dict)):
+              raise SystemExit("ERROR: Unexpected JSON structure.")
+
+          if not data:
+              raise SystemExit("ERROR: Station data is empty.")
+
+          print("Basic JSON validation passed.")
+          PY
+
+      - name: Check changes
+        run: git diff --check
 
       - name: Commit stations.json to the repo
         uses: stefanzweifel/git-auto-commit-action@v5
