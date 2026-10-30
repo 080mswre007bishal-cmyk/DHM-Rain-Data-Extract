@@ -12,7 +12,7 @@ For every station in stations.json:
   5. In the station popup/panel, select "Daily".
   6. Click "VIEW".
   7. Read the Date | Daily Rainfall table.
-  8. Keep only dates strictly before MANUAL_CUTOFF_DATE.
+  8. Skip today's row.
   9. Save the data locally as output/<station>.xlsx.
  10. Create/find a separate Google Spreadsheet for this station.
  11. Add only dates that are not already present in that
@@ -117,11 +117,6 @@ NEPAL_OFFSET = datetime.timedelta(
     minutes=45
 )
 
-# MANUAL CUTOFF DATE:
-# Only extract/save rainfall observations strictly BEFORE this date.
-# For 2026-10-26, the latest eligible date is 2026-10-25.
-MANUAL_CUTOFF_DATE = "2026-10-26"
-
 
 # ============================================================
 # DATE PARSING
@@ -221,66 +216,6 @@ def nepal_today_iso():
     return now_npt.date().strftime(
         "%Y-%m-%d"
     )
-
-
-
-def _excel_date_set(path):
-    """Return normalized dates already stored in a station Excel file."""
-    dates = set()
-    if not os.path.exists(path):
-        return dates
-
-    try:
-        wb = load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or row[0] is None:
-                continue
-            value = row[0]
-            if isinstance(value, datetime.datetime):
-                dates.add(value.date().strftime("%Y-%m-%d"))
-            elif isinstance(value, datetime.date):
-                dates.add(value.strftime("%Y-%m-%d"))
-            else:
-                parsed = parse_date_token(str(value).strip())
-                if parsed:
-                    dates.add(parsed)
-        wb.close()
-    except Exception as exc:
-        print(f"   WARNING: could not read existing Excel dates: {exc}")
-
-    return dates
-
-
-def find_missing_dates_from_excel(path):
-    """
-    Detect gaps from the earliest date already stored in Excel up to the
-    day before MANUAL_CUTOFF_DATE.
-
-    If no usable Excel dates exist, return [] because there is no reliable
-    start date for an automatic historical backfill.
-    """
-    existing = _excel_date_set(path)
-    if not existing:
-        print("   No existing Excel dates; date-gap backfill has no start date yet.")
-        return []
-
-    cutoff_date = datetime.date.fromisoformat(MANUAL_CUTOFF_DATE)
-    end_date = cutoff_date - datetime.timedelta(days=1)
-    start_date = min(datetime.date.fromisoformat(d) for d in existing)
-
-    if start_date > end_date:
-        return []
-
-    missing = []
-    day = start_date
-    while day <= end_date:
-        iso = day.strftime("%Y-%m-%d")
-        if iso not in existing:
-            missing.append(iso)
-        day += datetime.timedelta(days=1)
-
-    return missing
 
 
 # ============================================================
@@ -924,213 +859,6 @@ def click_view_in_panel(
 
 
 # ============================================================
-# HISTORICAL DATE SELECTOR
-# ============================================================
-
-def set_panel_date(panel, target_iso, debug_tag=None):
-    """Type the requested date directly into the station date field.
-
-    This deliberately does not depend on choosing a day from the calendar popup.
-    It tries common full-date text formats, removes a readonly attribute when the
-    page uses a readonly text input, fires input/change events, and verifies the
-    value before allowing the scraper to continue.
-    """
-    target = datetime.date.fromisoformat(target_iso)
-    date_debug = []
-    changed = False
-
-    def parse_control_date(value):
-        if not value:
-            return None
-        value = str(value).strip()
-        for fmt in (
-            "%Y-%m-%d", "%Y-%m-%dT%H:%M", "%d/%m/%Y", "%m/%d/%Y",
-            "%d-%m-%Y", "%m-%d-%Y", "%d %b, %Y", "%d %B, %Y",
-            "%a, %b %d, %Y, %I:%M %p", "%a, %b %d, %Y",
-            "%m/%d/%y", "%d/%m/%y",
-        ):
-            try:
-                return datetime.datetime.strptime(value, fmt).date()
-            except ValueError:
-                pass
-        # Some date inputs show a timestamp or a localized date plus time.
-        match = re.search(r"(\d{4}-\d{2}-\d{2})", value)
-        if match:
-            try:
-                return datetime.date.fromisoformat(match.group(1))
-            except ValueError:
-                pass
-        return None
-
-    def formats_for(meta):
-        field_type = (meta.get("type") or "").lower()
-        current = (meta.get("value") or "").strip()
-        placeholder = (meta.get("placeholder") or "").strip()
-        descriptor = " ".join(str(meta.get(k, "")) for k in (
-            "name", "id", "className", "placeholder", "aria", "title"
-        )).lower()
-        if field_type == "date":
-            return [target_iso]
-        if field_type == "datetime-local":
-            return [target_iso + "T00:00"]
-        sample = placeholder or current
-        candidates = [target_iso, target.strftime("%m/%d/%Y"), target.strftime("%d/%m/%Y"),
-                      target.strftime("%m-%d-%Y"), target.strftime("%d-%m-%Y"),
-                      target.strftime("%b %d, %Y"), target.strftime("%B %d, %Y")]
-        if "dd/mm" in descriptor or "day/month" in descriptor:
-            candidates = [target.strftime("%d/%m/%Y"), target_iso, target.strftime("%m/%d/%Y")] + candidates
-        elif "mm/dd" in descriptor or "month/day" in descriptor:
-            candidates = [target.strftime("%m/%d/%Y"), target_iso, target.strftime("%d/%m/%Y")] + candidates
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", sample):
-            a, b, _ = sample.split("/")
-            if int(a) > 12:
-                candidates = [target.strftime("%d/%m/%Y"), target_iso, target.strftime("%m/%d/%Y")] + candidates
-            else:
-                candidates = [target.strftime("%m/%d/%Y"), target_iso, target.strftime("%d/%m/%Y")] + candidates
-        # unique while retaining order
-        return list(dict.fromkeys(candidates))
-
-    try:
-        inputs = panel.locator("input:visible")
-        date_debug.append(f"Visible input count in station panel: {inputs.count()}")
-        for i in range(inputs.count()):
-            field = inputs.nth(i)
-            try:
-                meta = field.evaluate("""el => ({
-                    type: (el.type || '').toLowerCase(), name: el.name || '',
-                    id: el.id || '', className: typeof el.className === 'string' ? el.className : '',
-                    placeholder: el.placeholder || '', aria: el.getAttribute('aria-label') || '',
-                    title: el.title || '', value: el.value || '', readOnly: !!el.readOnly,
-                    disabled: !!el.disabled, outerHTML: el.outerHTML,
-                    parentHTML: el.parentElement ? el.parentElement.outerHTML.slice(0, 3000) : ''
-                })""")
-                descriptor = " ".join(str(meta.get(k, "")) for k in (
-                    "name", "id", "className", "placeholder", "aria", "title"
-                )).lower()
-                is_date = (
-                    meta.get("type") in ("date", "datetime-local")
-                    or any(word in descriptor for word in (
-                        "date", "datepicker", "start date", "end date", "from date", "to date"
-                    ))
-                )
-                if not is_date or meta.get("disabled"):
-                    continue
-
-                candidates = formats_for(meta)
-                date_debug.append(
-                    f"Candidate input #{i}: metadata={json.dumps(meta, ensure_ascii=False)}\n"
-                    f"Candidate values in order={candidates!r}"
-                )
-                print(
-                    f"   Date field candidate #{i}: type={meta.get('type')!r}, "
-                    f"descriptor={descriptor!r}, current={meta.get('value')!r}, "
-                    f"readonly={meta.get('readOnly')}; typing target date {target_iso}."
-                )
-
-                # Try direct keyboard entry first for text controls. The calendar
-                # popup is ignored; Ctrl+A replaces the complete existing date.
-                for desired in candidates:
-                    try:
-                        field.evaluate("""el => {
-                            el.removeAttribute('readonly');
-                            el.readOnly = false;
-                            el.focus();
-                        }""")
-                        field.click(timeout=2000, force=True)
-                        field.press("Control+A", timeout=1500)
-                        field.fill(desired, timeout=2500)
-                        field.dispatch_event("input", {"bubbles": True})
-                        field.dispatch_event("change", {"bubbles": True})
-                        field.press("Tab", timeout=1500)
-                        panel.page.wait_for_timeout(200)
-                        actual = field.input_value(timeout=1500)
-                        parsed_actual = parse_control_date(actual)
-                        date_debug.append(
-                            f"Direct entry attempt: desired={desired!r}; actual={actual!r}; "
-                            f"parsed={parsed_actual}; target={target}"
-                        )
-                        if parsed_actual == target:
-                            changed = True
-                            print(f"   Date entry verified: {actual!r} represents {target_iso}.")
-                            break
-                    except Exception as exc:
-                        date_debug.append(f"Direct entry {desired!r} failed: {exc}")
-
-                # Final fallback: set the input's native value and fire events.
-                # This helps when a framework intercepts typing but still listens
-                # for the standard input/change events.
-                if not changed:
-                    try:
-                        desired = candidates[0]
-                        result = field.evaluate("""(el, value) => {
-                            const proto = el.tagName === 'TEXTAREA'
-                                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-                            if (setter) setter.call(el, value); else el.value = value;
-                            el.dispatchEvent(new Event('input', {bubbles: true}));
-                            el.dispatchEvent(new Event('change', {bubbles: true}));
-                            el.blur();
-                            return {value: el.value, type: el.type, outerHTML: el.outerHTML};
-                        }""", desired)
-                        panel.page.wait_for_timeout(250)
-                        actual = field.input_value(timeout=1500)
-                        parsed_actual = parse_control_date(actual)
-                        date_debug.append(
-                            f"Native setter fallback: result={result!r}; actual={actual!r}; "
-                            f"parsed={parsed_actual}; target={target}"
-                        )
-                        if parsed_actual == target:
-                            changed = True
-                            print(f"   Date entry verified via direct value setter: {actual!r}.")
-                    except Exception as exc:
-                        date_debug.append(f"Native setter fallback failed: {exc}")
-
-                if debug_tag:
-                    safe_tag = re.sub(r"[^\w.-]+", "_", debug_tag)
-                    try:
-                        panel.page.screenshot(
-                            path=os.path.join(DEBUG_DIR, f"{safe_tag}_date_picker_set.png")
-                        )
-                    except Exception:
-                        pass
-                # Do not continue through unrelated date-looking inputs after
-                # identifying the intended station date control.
-                break
-            except Exception as exc:
-                date_debug.append(f"Input #{i} processing error: {exc}")
-    except Exception as exc:
-        date_debug.append(f"Input enumeration error: {exc}")
-
-    if debug_tag:
-        save_debug_file(debug_tag, "_date_picker_debug.txt", "\n\n".join(date_debug))
-    if not changed:
-        print(f"   ERROR: Could not set the DHM date field to {target_iso} by direct text entry.")
-    return changed
-
-
-def fetch_one_historical_date(page, panel, target_iso):
-    """Select one historical date, click VIEW, and return its rainfall row if found."""
-    print(f"   Backfill attempt: {target_iso}")
-    if not set_panel_date(panel, target_iso):
-        print("   WARNING: no recognizable date input/select was found; cannot select this date automatically.")
-        return False
-
-    if not click_view_in_panel(panel):
-        print(f"   WARNING: VIEW click failed for {target_iso}")
-        return None
-
-    page.wait_for_timeout(1800)
-    rows = table_rows_from_panel(panel)
-    for date_str, rainfall in rows:
-        if date_str == target_iso:
-            print(f"   Recovered {target_iso}: {rainfall} mm")
-            return (date_str, rainfall)
-
-    print(f"   WARNING: DHM did not return a rainfall row for {target_iso}.")
-    return None
-
-
-# ============================================================
 # TABLE PARSING
 # ============================================================
 
@@ -1471,8 +1199,7 @@ def close_any_panel(page):
 def process_station(
     page,
     station,
-    debug_tag=None,
-    missing_dates=None,
+    debug_tag=None
 ):
     """
     Returns:
@@ -1482,7 +1209,7 @@ def process_station(
             ...
         ]
 
-    Only rows dated strictly before MANUAL_CUTOFF_DATE are retained.
+    Today's row is excluded.
     """
 
     station_index = station.get(
@@ -1731,30 +1458,6 @@ def process_station(
         )
 
     # --------------------------------------------------------
-    # Set the DHM panel date to the manually configured cutoff
-    # before clicking VIEW. The table is then parsed using the
-    # existing table parser, and the cutoff filter below keeps
-    # only records strictly earlier than MANUAL_CUTOFF_DATE.
-    # --------------------------------------------------------
-
-    date_set_ok = set_panel_date(
-        panel,
-        MANUAL_CUTOFF_DATE,
-        debug_tag=debug_tag,
-    )
-
-    if date_set_ok:
-        print(
-            f"   DHM date control set to {MANUAL_CUTOFF_DATE}."
-        )
-    else:
-        print(
-            f"   WARNING: Could not identify/set a DHM date control "
-            f"to {MANUAL_CUTOFF_DATE}; VIEW will still be clicked, "
-            f"and the displayed table will be parsed as before."
-        )
-
-    # --------------------------------------------------------
     # Click VIEW
     # --------------------------------------------------------
 
@@ -1814,107 +1517,26 @@ def process_station(
         )
     )
 
-    # Verify the table's newest row, not merely the presence of the target date.
-    # A rolling table for 29 Oct also contains 26 Oct, so checking only for
-    # membership would incorrectly treat the unmodified current table as success.
-    displayed_dates = [row[0] for row in all_rows]
-    newest_displayed_date = max(displayed_dates) if displayed_dates else None
-    date_query_verified = newest_displayed_date == MANUAL_CUTOFF_DATE
-
-    if debug_tag:
-        save_debug_file(
-            debug_tag,
-            "_date_table_verification.txt",
-            f"requested_date: {MANUAL_CUTOFF_DATE}\n"
-            f"date_input_set_ok: {date_set_ok}\n"
-            f"newest_displayed_date: {newest_displayed_date}\n"
-            f"displayed_dates: {displayed_dates}\n"
-            f"table_matches_requested_date: {date_query_verified}\n",
-        )
-        try:
-            safe_tag = re.sub(r"[^\w.-]+", "_", debug_tag)
-            page.screenshot(
-                path=os.path.join(DEBUG_DIR, f"{safe_tag}_after_date_view.png"),
-                full_page=False,
-            )
-        except Exception:
-            pass
-
-    if not date_query_verified:
-        print(
-            f"   WARNING: DHM table did NOT refresh to the requested date "
-            f"{MANUAL_CUTOFF_DATE}. Newest displayed date is "
-            f"{newest_displayed_date or 'no dates'}, not {MANUAL_CUTOFF_DATE}. "
-            f"The date input may have changed without the table query updating."
-        )
-    else:
-        print(
-            f"   Verified: newest date in DHM table is exactly "
-            f"{MANUAL_CUTOFF_DATE}; the date query appears to have applied."
-        )
-
     # --------------------------------------------------------
-    # Keep only rows strictly before the manual cutoff date
+    # Remove today's row
     # --------------------------------------------------------
 
-    cutoff_date = datetime.date.fromisoformat(MANUAL_CUTOFF_DATE)
+    today = nepal_today_iso()
 
-    if date_query_verified:
-        kept_rows = [
-            row
-            for row in all_rows
-            if datetime.date.fromisoformat(row[0]) < cutoff_date
-        ]
-    else:
-        # Do not save a partial/stale rolling table as though DHM applied
-        # the requested historical date. Keep the debug log for diagnosis.
-        kept_rows = []
-        print(
-            "   ERROR: Not saving rows for this station because the DHM "
-            "table did not verify the requested date."
-        )
-
-    excluded_rows = [
-        row for row in all_rows
-        if datetime.date.fromisoformat(row[0]) >= cutoff_date
+    kept_rows = [
+        row
+        for row in all_rows
+        if row[0] != today
     ]
 
-    print(
-        f"   Manual cutoff: {MANUAL_CUTOFF_DATE} "
-        f"(only dates before this date are eligible)."
-    )
+    if today in {
+        row[0]
+        for row in all_rows
+    }:
 
-    if excluded_rows:
         print(
-            f"   Excluded {len(excluded_rows)} row(s) dated "
-            f"on or after {MANUAL_CUTOFF_DATE}."
+            f"   Skipped today's row: {today}"
         )
-
-    # --------------------------------------------------------
-    # Backfill missing dates detected from the existing Excel file
-    # --------------------------------------------------------
-
-    recovered = {date_str: value for date_str, value in kept_rows}
-    missing_dates = missing_dates or []
-    dates_to_try = [
-        d for d in missing_dates
-        if date_query_verified and d < MANUAL_CUTOFF_DATE and d not in recovered
-    ]
-
-    if dates_to_try:
-        print(f"   Excel gap detection found {len(dates_to_try)} date(s) to attempt.")
-        for target_iso in dates_to_try:
-            try:
-                row = fetch_one_historical_date(page, panel, target_iso)
-                if row is False:
-                    print("   Stopping automatic backfill because DHM's date selector was not recognized.")
-                    break
-                if row:
-                    recovered[row[0]] = row[1]
-            except Exception as exc:
-                print(f"   WARNING: backfill failed for {target_iso}: {exc}")
-
-        kept_rows = sorted(recovered.items())
 
     # --------------------------------------------------------
     # Debug result
@@ -1928,11 +1550,8 @@ def process_station(
             f"filtered_ok: {filtered_ok}\n"
             f"marker_clicked: {marker_clicked}\n"
             f"period_ok: {period_ok}\n"
-            f"date_set_ok: {date_set_ok}\n"
-            f"date_query_verified: {date_query_verified}\n"
             f"view_ok: {view_ok}\n"
-            f"manual_cutoff_date: {MANUAL_CUTOFF_DATE}\n"
-            f"missing_dates_requested: {dates_to_try if missing_dates else []}\n"
+            f"today: {today}\n"
             f"all_rows: {all_rows}\n"
             f"kept_rows: {kept_rows}\n",
         )
@@ -2840,18 +2459,7 @@ def main():
                 )
 
             # ------------------------------------------------
-            # Detect missing dates from local Excel before scraping
-            # ------------------------------------------------
-
-            missing_dates = find_missing_dates_from_excel(filepath)
-            if missing_dates:
-                print(
-                    f"   Excel gap check: {len(missing_dates)} missing date(s) "
-                    f"from {missing_dates[0]} through {missing_dates[-1]} (dates on/after manual cutoff excluded)."
-                )
-
-            # ------------------------------------------------
-            # Process station
+            # Scrape station
             # ------------------------------------------------
 
             try:
@@ -2860,7 +2468,6 @@ def main():
                     page,
                     station,
                     debug_tag=debug_tag,
-                    missing_dates=missing_dates,
                 )
 
             except Exception as e:
